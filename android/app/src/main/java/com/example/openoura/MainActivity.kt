@@ -105,7 +105,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
 
+    override fun onResume() {
+        super.onResume()
+        // Perform verification checks only when the user returns to focus
         checkAndRequestPermissions()
         recoverPostRebirthAssociation()
     }

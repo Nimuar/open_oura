@@ -100,9 +100,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 OuraBleService.syncProgress.collect { _syncProgress.value = it }
             }
 
-            // Handle pending pairing if it exists
+            // CRITICAL: Prioritize volatile pending pair states over passive auto-reconnections
             pendingPairing?.let { (mac, key) ->
-                Log.i("MainScreenViewModel", "Executing pending pairing for $mac")
+                Log.i("MainScreenViewModel", "Executing recovered pending pairing for $mac")
                 service?.pairNewRing(mac, key)
                 pendingPairing = null
             } ?: run {
@@ -249,13 +249,19 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     fun onCompanionAssociated(macAddress: String) {
         setScanning(false)
         val sanitizedMac = macAddress.uppercase()
-        val keyBytes = ByteArray(16)
-        SecureRandom().nextBytes(keyBytes)
-        val keyHex = byteArrayToHexString(keyBytes)
 
-        // Save credentials
+        // Check if we have an existing key context, otherwise allocate a clean token
+        var keyHex = securePrefs.getString("ring_key", null)
+        val keyBytes = if (keyHex == null) {
+            ByteArray(16).apply { SecureRandom().nextBytes(this) }.also {
+                keyHex = byteArrayToHexString(it)
+                securePrefs.edit().putString("ring_key", keyHex).apply()
+            }
+        } else {
+            hexStringToByteArray(keyHex!!)
+        }
+
         sharedPrefs.edit().putString("ring_mac", sanitizedMac).apply()
-        securePrefs.edit().putString("ring_key", keyHex).apply()
 
         // Start observing presence at the OS level
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -273,7 +279,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             Log.i("MainScreenViewModel", "Service alive, entering initial pairing handshake.")
             service?.pairNewRing(sanitizedMac, keyBytes)
         } else {
-            Log.i("MainScreenViewModel", "Service not bound yet. Initializing background link.")
+            Log.i("MainScreenViewModel", "Service unlinked during rebirth. Caching pending configuration.")
+            // CACHE HERE: This forces onServiceConnected to execute the link immediately on bind
+            pendingPairing = Pair(sanitizedMac, keyBytes)
             initializeService()
         }
     }
