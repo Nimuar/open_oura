@@ -26,6 +26,7 @@ import com.example.openoura.health.HealthConnectManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -99,8 +100,11 @@ class OuraBleService : Service() {
     private var activeKey: ByteArray? = null
     private var isPairingFlow = false
 
-    // Raw bytes receiver buffer to handle fragmented packets
-    private val notificationBuffer = ArrayList<Byte>()
+    // A thread-safe FIFO queue for raw hardware packets
+    private val inboundPacketChannel = Channel<ByteArray>(Channel.UNLIMITED)
+
+    // Raw bytes accumulator to handle fragmented packets
+    private var notificationBuffer = ByteArray(0)
     private var expectedLength = 0
 
     // Callback listeners for transactional requests
@@ -128,6 +132,13 @@ class OuraBleService : Service() {
         bluetoothAdapter = bluetoothManager.adapter
         
         Log.d(TAG, "Service Created. Initial state: ${connectionState.value}")
+
+        // Start the sequential packet processing daemon
+        serviceScope.launch {
+            for (data in inboundPacketChannel) {
+                processRawPacket(data)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -318,11 +329,14 @@ class OuraBleService : Service() {
             }
         }
 
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            inboundPacketChannel.trySend(value.clone())
+        }
+
+        @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             val data = characteristic.value ?: return
-            serviceScope.launch {
-                handleInboundNotification(data)
-            }
+            inboundPacketChannel.trySend(data.clone())
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
@@ -590,23 +604,19 @@ class OuraBleService : Service() {
     }
 
     /**
-     * Reassemble fragmented packets from notifications.
+     * Sequential packet reassembly and dispatch.
      */
-    private fun handleInboundNotification(data: ByteArray) {
-        for (b in data) {
-            notificationBuffer.add(b)
-        }
+    private fun processRawPacket(data: ByteArray) {
+        notificationBuffer += data
 
-        if (notificationBuffer.size >= 2) {
-            expectedLength = notificationBuffer[1].toInt() and 0xff
-            val totalExpected = 2 + expectedLength
+        while (notificationBuffer.size >= 2) {
+            val tag = notificationBuffer[0]
+            val len = notificationBuffer[1].toInt() and 0xff
+            val totalExpected = 2 + len
 
             if (notificationBuffer.size >= totalExpected) {
-                val fullPacketBytes = notificationBuffer.take(totalExpected).toByteArray()
-                // Clear parsed bytes from buffer
-                for (i in 0 until totalExpected) {
-                    notificationBuffer.removeAt(0)
-                }
+                val fullPacketBytes = notificationBuffer.copyOfRange(0, totalExpected)
+                notificationBuffer = notificationBuffer.copyOfRange(totalExpected, notificationBuffer.size)
 
                 val packet = Packet.parse(fullPacketBytes)
                 if (packet != null) {
@@ -625,6 +635,8 @@ class OuraBleService : Service() {
                     // Process stream packets (e.g. ACM Live Data)
                     handleStreamPacket(packet)
                 }
+            } else {
+                break
             }
         }
     }
