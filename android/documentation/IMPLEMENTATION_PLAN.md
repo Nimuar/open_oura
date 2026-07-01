@@ -51,6 +51,18 @@ This plan describes the architectural changes to harden the `open_oura` Android 
     *   **ByteBuffer Serialization**: Rewrite array builders in `Req` utilizing `ByteBuffer` allocations to optimize memory and minimize GC pauses during active BLE streams.
     *   **Constants over Magic Numbers**: Define protocol command bytes (tags, sub-tags, flags) as clean descriptive Kotlin constants at the top of `OuraGATT.kt`.
 
+### 1.7 Dashboard Log Filtering (UI Bug Fix)
+*   **The Problem:** The Compose dashboard's "Last Synced Events" card displays trailing system telemetry event packets (tags `0x43` and `0x61`) emitted at the end of a sync, pushing actual biometric events out of view.
+*   **The Fix:** Update the dashboard event rendering logic to filter out non-biometric tag logs (`0x43` `debug_event` and `0x61` `debug_data`), leaving only actual metric summaries (HR/HRV) visible to the user.
+
+### 1.8 Missing Biometric Tag Mapping (Health Ingestion Fix)
+*   **The Problem:** Newer Oura Ring models store sleep or live biometric readings under tags `0x55` (`sleep_heart_rate`), `0x71` (`green_ibi_and_amplitude_event`), and `0x6e` (`spo2_ibi_and_amplitude_event`). The native Rust library does not decode these tags, and `HealthConnectManager.kt` drops them.
+*   **The Fix:** Implement decoders in `crates/oura-protocol/src/events.rs` and extend the Kotlin event mapper to bind and write these samples to Health Connect.
+
+### 1.9 Pairing State Machine Fallback & State Re-Push (State Recovery Fix)
+*   **The Problem:** If a user pairs a pre-keyed ring (key already written), the ring ignores the `0x24` (`SetAuthKey`) pairing handshake packet, causing the connection setup sequence to time out. Additionally, binding race conditions can cause the UI to miss early connection state updates.
+*   **The Fix:** Update `runSetupFlow` to fall back immediately to standard `0x2f` challenge-response authentication if the `0x24` handshake fails. Force-push the current connection state inside `onServiceConnected` during ViewModel binding.
+
 ---
 
 ## 2. Proposed Changes

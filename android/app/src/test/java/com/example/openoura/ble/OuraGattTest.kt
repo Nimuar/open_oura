@@ -39,6 +39,13 @@ class OuraGattTest {
     }
 
     @Test
+    fun testPacketParseTruncated() {
+        val truncatedFrame = byteArrayOf(0x42, 0x05, 0x01, 0x02)
+        val packet = Packet.parse(truncatedFrame)
+        assertNull(packet)
+    }
+
+    @Test
     fun testReqBuilders() {
         val payload = byteArrayOf(0xaa.toByte(), 0xbb.toByte())
         val pkt = Req.packet(0x10.toByte(), payload)

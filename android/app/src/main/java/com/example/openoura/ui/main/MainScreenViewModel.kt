@@ -18,12 +18,12 @@ import android.companion.CompanionDeviceManager
 import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKeys
 import com.example.openoura.ble.ConnectionState
 import com.example.openoura.ble.OuraBleService
 import com.example.openoura.ble.OuraDeviceMetadata
+import com.example.openoura.ble.auth.CredentialStore
 import com.example.openoura.ffi.OuraFfiBridge
+import com.example.openoura.ffi.OuraFfiWrapper
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -38,22 +38,16 @@ class DiscoveredDevice(val name: String, val address: String)
  * credentials storage, and interacts with the foreground OuraBleService.
  */
 @SuppressLint("MissingPermission")
-class MainScreenViewModel(application: Application) : AndroidViewModel(application) {
+class MainScreenViewModel @JvmOverloads constructor(
+    application: Application,
+    private val ffi: OuraFfiWrapper = OuraFfiBridge
+) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
     private var service: OuraBleService? = null
     private var isBound = false
 
-    private val sharedPrefs = context.getSharedPreferences("open_oura_prefs", Context.MODE_PRIVATE)
-
-    private val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
-    private val securePrefs = EncryptedSharedPreferences.create(
-        "oura_secure_prefs",
-        masterKeyAlias,
-        context,
-        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-    )
+    private val credentialStore = CredentialStore(application)
 
     // Flow states mirroring service state
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
@@ -86,7 +80,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private var pendingPairing: Pair<String, ByteArray>? = null
-
     private var pairingAttemptCount = 0
 
     private val serviceConnection = object : ServiceConnection {
@@ -95,6 +88,13 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             val boundService = ouraBinder.getService()
             service = boundService
             isBound = true
+
+            // Force-push the current connection state immediately on bind (F-2.14)
+            val initialStatus = OuraBleService.connectionState.value
+            _connectionState.value = initialStatus
+            if (initialStatus == ConnectionState.Ready) {
+                pairingAttemptCount = 0
+            }
 
             // Attach listeners to service flows
             viewModelScope.launch {
@@ -135,22 +135,25 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     init {
-        // Poll diagnostics from Rust FFI queue every 500ms
+        // Poll diagnostics in bulk from Rust FFI queue every 500ms
         viewModelScope.launch {
             while (true) {
                 delay(500)
                 try {
-                    val logMsg = OuraFfiBridge.popDiagnostic()
-                    if (logMsg != null) {
+                    val drainResult = ffi.drainDiagnostics()
+                    val logs = drainResult.getOrNull()
+                    if (!logs.isNullOrEmpty()) {
                         val currentLogs = _diagnosticLogs.value.toMutableList()
-                        if (currentLogs.size >= 200) {
-                            currentLogs.removeAt(0)
+                        currentLogs.addAll(logs)
+                        if (currentLogs.size > 200) {
+                            val keep = currentLogs.takeLast(200)
+                            _diagnosticLogs.value = keep
+                        } else {
+                            _diagnosticLogs.value = currentLogs
                         }
-                        currentLogs.add(logMsg)
-                        _diagnosticLogs.value = currentLogs
                     }
                 } catch (e: Throwable) {
-                    Log.e("MainScreenViewModel", "Failed to pop diagnostic: ${e.message}")
+                    Log.e("MainScreenViewModel", "Failed to drain diagnostics: ${e.message}")
                     delay(2000) // Back off on error
                 }
             }
@@ -206,8 +209,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         if (active) {
             OuraBleService.updateConnectionState(ConnectionState.Scanning, "User started scanning")
         } else {
-            // When stopping, only revert to Idle if we were actually scanning.
-            // This prevents overwriting 'Connecting' or 'Ready' states during rebirth recovery.
             val currentState = OuraBleService.connectionState.value
             if (currentState == ConnectionState.Scanning) {
                 OuraBleService.updateConnectionState(ConnectionState.Idle, "Scanning stopped/cancelled")
@@ -219,7 +220,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
             val name = device.name ?: result.scanRecord?.deviceName ?: "Unknown Device"
-            
+
             Log.d("MainScreenViewModel", "Discovered: $name (${device.address})")
 
             if (name.contains("Oura", ignoreCase = true) || name.contains("Ring", ignoreCase = true)) {
@@ -249,9 +250,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 return
             }
 
-            // Save credentials
-            sharedPrefs.edit().putString("ring_mac", sanitizedMac).apply()
-            securePrefs.edit().putString("ring_key", keyHex).apply()
+            // Save credentials via store
+            credentialStore.saveCredentials(sanitizedMac, keyHex.trim())
+            credentialStore.setPairingVerified(true)
 
             service?.connectToDevice(sanitizedMac, keyBytes)
         } catch (e: Exception) {
@@ -264,27 +265,27 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      * Generates a key, registers for range/presence events, and runs initial pairing.
      */
     fun onCompanionAssociated(macAddress: String) {
-        // If we've already tried too many times, abort auto-retry to prevent loops
         if (pairingAttemptCount >= 3) {
             Log.w("MainScreenViewModel", "Max pairing retries reached. Standing down.")
             _connectionState.value = ConnectionState.Failed("Maximum connection retries exceeded.")
             return
         }
         setScanning(false)
+        
+        // Immediately update connection state to Connecting to clear scanning overlays in Compose UI (Ghost Scanning Fix)
+        _connectionState.value = ConnectionState.Connecting
+
         val sanitizedMac = macAddress.uppercase()
 
-        // Check if we have an existing key context, otherwise allocate a clean token
-        var keyHex = securePrefs.getString("ring_key", null)
+        // Check if we have an existing key context, otherwise allocate a clean token (Key Erasure Fix)
+        var keyHex = credentialStore.getSavedKeyHex()
         val keyBytes = if (keyHex == null) {
-            ByteArray(16).apply { SecureRandom().nextBytes(this) }.also {
-                keyHex = byteArrayToHexString(it)
-                securePrefs.edit().putString("ring_key", keyHex).apply()
-            }
+            val generated = ByteArray(16).apply { SecureRandom().nextBytes(this) }
+            keyHex = byteArrayToHexString(generated)
+            generated
         } else {
             hexStringToByteArray(keyHex!!)
         }
-
-        sharedPrefs.edit().putString("ring_mac", sanitizedMac).apply()
 
         // Start observing presence at the OS level
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -303,7 +304,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             service?.pairNewRing(sanitizedMac, keyBytes)
         } else {
             Log.i("MainScreenViewModel", "Service unlinked during rebirth. Caching pending configuration.")
-            // CACHE HERE: This forces onServiceConnected to execute the link immediately on bind
             pendingPairing = Pair(sanitizedMac, keyBytes)
             initializeService()
         }
@@ -317,11 +317,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         val sanitizedMac = macAddress.uppercase()
         val keyBytes = ByteArray(16)
         SecureRandom().nextBytes(keyBytes)
-        val keyHex = byteArrayToHexString(keyBytes)
 
-        // Save credentials
-        sharedPrefs.edit().putString("ring_mac", sanitizedMac).apply()
-        securePrefs.edit().putString("ring_key", keyHex).apply()
+        // Immediately update connection state to Connecting to clear scanning overlays in Compose UI (Ghost Scanning Fix)
+        _connectionState.value = ConnectionState.Connecting
 
         service?.pairNewRing(sanitizedMac, keyBytes)
     }
@@ -337,7 +335,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun forgetDevice() {
-        val mac = sharedPrefs.getString("ring_mac", null)
+        val mac = credentialStore.getSavedMacAddress()
         disconnect()
 
         if (mac != null) {
@@ -358,8 +356,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             }
         }
 
-        sharedPrefs.edit().remove("ring_mac").remove("sync_cursor").apply()
-        securePrefs.edit().remove("ring_key").apply()
+        credentialStore.clear()
         OuraBleService.updateConnectionState(ConnectionState.Idle, "User cleared device")
         _deviceMetadata.value = OuraDeviceMetadata()
     }
@@ -368,8 +365,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      * Public trigger to connect to the saved device using existing credentials.
      */
     fun connectAndSync() {
-        val mac = sharedPrefs.getString("ring_mac", null)
-        val keyHex = securePrefs.getString("ring_key", null)
+        val mac = credentialStore.getSavedMacAddress()
+        val keyHex = credentialStore.getSavedKeyHex()
         if (mac != null && keyHex != null) {
             connectDevice(mac, keyHex)
         } else {
@@ -378,14 +375,14 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private fun autoReconnectIfPossible() {
-        val mac = sharedPrefs.getString("ring_mac", null)
-        val keyHex = securePrefs.getString("ring_key", null)
-        if (mac != null && keyHex != null) {
+        val mac = credentialStore.getSavedMacAddress()
+        val keyHex = credentialStore.getSavedKeyHex()
+        val isVerified = credentialStore.isPairingVerified()
+
+        if (mac != null && keyHex != null && isVerified) {
             val sanitizedMac = mac.uppercase()
             val keyBytes = hexStringToByteArray(keyHex)
 
-            // If our application state indicates we dropped mid-pairing or just associated,
-            // run pairNewRing instead of connectToDevice to force a 0x25 token write.
             if (OuraBleService.connectionState.value == ConnectionState.Idle) {
                 Log.i("MainScreenViewModel", "Auto-recovering link state for device: $sanitizedMac")
                 service?.connectToDevice(sanitizedMac, keyBytes)
@@ -393,8 +390,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    fun getSavedMacAddress(): String? = sharedPrefs.getString("ring_mac", null)
-    fun getSavedKeyHex(): String? = securePrefs.getString("ring_key", null)
+    fun getSavedMacAddress(): String? = credentialStore.getSavedMacAddress()
+    fun getSavedKeyHex(): String? = credentialStore.getSavedKeyHex()
 
     private fun hexStringToByteArray(s: String): ByteArray {
         val len = s.length

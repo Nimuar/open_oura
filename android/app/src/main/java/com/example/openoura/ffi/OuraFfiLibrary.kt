@@ -52,8 +52,8 @@ interface OuraFfiLibrary : Library {
     )
 
     /**
-     * Pop the oldest diagnostic log message from the Rust-native diagnostics queue.
-     * The returned string pointer is owned by the caller and must be released with [oura_string_free].
+     * Drain all diagnostic log messages from the Rust-native diagnostics queue.
+     * The returned string pointer represents a JSON array, is owned by the caller, and must be released with [oura_string_free].
      */
-    fun oura_pop_diagnostic(): Pointer?
+    fun oura_drain_diagnostics(): Pointer?
 }

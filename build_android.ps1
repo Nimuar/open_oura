@@ -15,7 +15,7 @@ $RustBuildArtifact = Join-Path $ProjectRoot "target\aarch64-linux-android\releas
 
 Write-Host "Building oura-ffi for arm64-v8a..."
 # Run cargo ndk build. Target Android API 34 (Android 14) or 35 (Android 15).
-cargo ndk -t arm64-v8a -P 35 build --package oura-ffi --release
+cargo ndk -t arm64-v8a -P 34 build --package oura-ffi --release
 
 if (-not (Test-Path $JniLibsDir)) {
     Write-Host "Creating JNI libs directory: $JniLibsDir"

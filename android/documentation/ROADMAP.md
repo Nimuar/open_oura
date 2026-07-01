@@ -17,6 +17,22 @@ The current MVP codebase has successfully implemented 2-byte native packet frami
 
 ---
 
+## Phase 1.5: Ingestion, State, and UI Hardening (Bugs and Gaps Resolution)
+
+The following bug-fixes and integration gaps will be resolved to ensure clean data delivery:
+
+### 1. Dashboard UI Log Filtering
+*   Filter out tag `0x43` (`debug_event`) and `0x61` (`debug_data`) events from the "Last Synced Events" Compose card so diagnostic data doesn't push actual heart rate/HRV summaries out of view.
+
+### 2. Extended Biometric Tag Ingestion
+*   Update `HealthConnectManager.kt` to parse heart rate and HRV samples from tags `0x55` (`sleep_heart_rate`), `0x71` (`green_ibi_and_amplitude_event`), and `0x6e` (`spo2_ibi_and_amplitude_event`) as they are decoded by the Rust core, preventing Health Connect data gaps.
+
+### 3. Setup Handshake Fallback & Binding Re-Push
+*   Auto-fallback to standard `0x2f` challenge-response authentication if the `0x24` (`SetAuthKey`) pairing handshake fails or times out.
+*   Force-push the current connection state inside `onServiceConnected` in the ViewModel immediately upon binding to resolve UI state refresh lag.
+
+---
+
 ## Phase 2: Post-MVP Feature Expansion
 
 Once the MVP's connection lifecycle is fully polished, the following features will be introduced to elevate the user experience.

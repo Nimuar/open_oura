@@ -28,19 +28,23 @@ fn log_diagnostic(msg: &str) {
     }
 }
 
-/// Pop the oldest diagnostic log message from the Rust-native diagnostics queue.
-/// Returns a null-terminated C-string representing the log message, or null if the queue
-/// is empty. The returned string is owned by the caller and must be released with [`oura_string_free`].
+/// Drain all diagnostic log messages from the Rust-native diagnostics queue.
+/// Returns a null-terminated C-string representing a JSON array of log messages (e.g. `["log1", "log2"]`).
+/// The returned string is owned by the caller and must be released with [`oura_string_free`].
 #[no_mangle]
-pub extern "C" fn oura_pop_diagnostic() -> *mut c_char {
+pub extern "C" fn oura_drain_diagnostics() -> *mut c_char {
     if let Ok(mut logs) = DIAGNOSTIC_LOGS.lock() {
-        if let Some(log) = logs.pop_front() {
-            return CString::new(log)
+        let drained: Vec<String> = logs.drain(..).collect();
+        if let Ok(serialized) = serde_json::to_string(&drained) {
+            return CString::new(serialized)
                 .map(|s| s.into_raw())
                 .unwrap_or(std::ptr::null_mut());
         }
     }
-    std::ptr::null_mut()
+    // Return empty array JSON on failure
+    CString::new("[]")
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Encrypt a ring auth nonce (AES-128/ECB/PKCS7) into `out` (must hold 16 bytes).
@@ -155,25 +159,23 @@ mod tests {
 
     #[test]
     fn test_diagnostics_queue() {
-        // Clear queue first by popping everything
-        while !oura_pop_diagnostic().is_null() {}
+        // Clear queue first by draining
+        let clear_ptr = oura_drain_diagnostics();
+        oura_string_free(clear_ptr);
 
         log_diagnostic("test log 1");
         log_diagnostic("test log 2");
 
-        let log_ptr1 = oura_pop_diagnostic();
-        assert!(!log_ptr1.is_null());
-        let c_str1 = unsafe { CStr::from_ptr(log_ptr1) };
-        assert_eq!(c_str1.to_str().unwrap(), "test log 1");
-        oura_string_free(log_ptr1);
+        let log_ptr = oura_drain_diagnostics();
+        assert!(!log_ptr.is_null());
+        let c_str = unsafe { CStr::from_ptr(log_ptr) };
+        assert_eq!(c_str.to_str().unwrap(), "[\"test log 1\",\"test log 2\"]");
+        oura_string_free(log_ptr);
 
-        let log_ptr2 = oura_pop_diagnostic();
-        assert!(!log_ptr2.is_null());
-        let c_str2 = unsafe { CStr::from_ptr(log_ptr2) };
-        assert_eq!(c_str2.to_str().unwrap(), "test log 2");
-        oura_string_free(log_ptr2);
-
-        let empty_ptr = oura_pop_diagnostic();
-        assert!(empty_ptr.is_null());
+        let empty_ptr = oura_drain_diagnostics();
+        assert!(!empty_ptr.is_null());
+        let empty_c_str = unsafe { CStr::from_ptr(empty_ptr) };
+        assert_eq!(empty_c_str.to_str().unwrap(), "[]");
+        oura_string_free(empty_ptr);
     }
 }

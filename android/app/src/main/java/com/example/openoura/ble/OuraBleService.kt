@@ -5,37 +5,32 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.pm.ServiceInfo
 import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.example.openoura.ble.auth.CredentialStore
+import com.example.openoura.ble.auth.OuraAuthenticator
+import com.example.openoura.ble.controller.OuraController
+import com.example.openoura.ble.sync.HistorySyncManager
+import com.example.openoura.ble.transport.BleTransportEngine
 import com.example.openoura.ffi.OuraFfiBridge
 import com.example.openoura.health.HealthConnectManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
-import java.io.FileWriter
-import java.util.UUID
 
 sealed class ConnectionState {
     object Idle : ConnectionState()
@@ -55,7 +50,8 @@ data class OuraDeviceMetadata(
 )
 
 /**
- * Foreground Service for managing the Oura BLE connection, authentication, and background sync.
+ * Foreground Service for coordinating OpenOura tasks, delegating operations to
+ * dedicated modular subsystems (Transport, Authentication, Sync, and Device Controller).
  */
 @SuppressLint("MissingPermission")
 class OuraBleService : Service() {
@@ -69,7 +65,7 @@ class OuraBleService : Service() {
         val connectionState: StateFlow<ConnectionState> = _connectionState
 
         /**
-         * Thread-safe state transition with logging.
+         * Thread-safe transition for connection state.
          */
         @Synchronized
         fun updateConnectionState(newState: ConnectionState, criteria: String = "Internal") {
@@ -83,9 +79,6 @@ class OuraBleService : Service() {
         private val _deviceMetadata = MutableStateFlow(OuraDeviceMetadata())
         val deviceMetadata: StateFlow<OuraDeviceMetadata> = _deviceMetadata
 
-        private val _liveHeartRate = MutableStateFlow<Int?>(null)
-        val liveHeartRate: StateFlow<Int?> = _liveHeartRate
-
         private val _syncProgress = MutableStateFlow<String?>(null)
         val syncProgress: StateFlow<String?> = _syncProgress
 
@@ -97,21 +90,18 @@ class OuraBleService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
 
     private var bluetoothAdapter: BluetoothAdapter? = null
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var writeCharacteristic: BluetoothGattCharacteristic? = null
 
-    private var activeKey: ByteArray? = null
-    private var isPairingFlow = false
+    @Volatile
+    private var pendingPairingMac: String? = null
+    @Volatile
+    private var pendingPairingKey: ByteArray? = null
 
-    // A thread-safe FIFO queue for raw hardware packets
-    private val inboundPacketChannel = Channel<ByteArray>(Channel.UNLIMITED)
-
-    // Raw bytes accumulator to handle fragmented packets
-    private var notificationBuffer = ByteArray(0)
-    private var expectedLength = 0
-
-    // Callback listeners for transactional requests
-    private val responseListeners = mutableListOf<(Packet) -> Boolean>()
+    // Subsystems
+    lateinit var credentialStore: CredentialStore
+    lateinit var transport: BleTransportEngine
+    lateinit var authenticator: OuraAuthenticator
+    lateinit var historySyncManager: HistorySyncManager
+    lateinit var controller: OuraController
 
     inner class OuraBinder : Binder() {
         fun getService(): OuraBleService = this@OuraBleService
@@ -133,16 +123,49 @@ class OuraBleService : Service() {
 
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
-        
+
+        // Instantiate Subsystems
+        credentialStore = CredentialStore(this)
+        controller = OuraController()
+
+        authenticator = OuraAuthenticator(
+            ffi = OuraFfiBridge,
+            onProgress = { progress -> _syncProgress.value = progress },
+            onStateChange = { state, reason -> updateConnectionState(state, reason) }
+        )
+
+        historySyncManager = HistorySyncManager(
+            context = this,
+            ffi = OuraFfiBridge,
+            credentialStore = credentialStore,
+            healthConnectManager = HealthConnectManager,
+            onProgress = { progress -> _syncProgress.value = progress },
+            onEventsSynced = { synced ->
+                _decodedEventHistory.value = _decodedEventHistory.value + synced
+            }
+        )
+
+        transport = BleTransportEngine(
+            context = this,
+            bluetoothAdapter = bluetoothAdapter!!,
+            scope = serviceScope,
+            onStateChange = { state, reason -> updateConnectionState(state, reason) },
+            onDescriptorEnabled = { isPairing ->
+                serviceScope.launch {
+                    runSetupFlow(isPairing)
+                }
+            }
+        )
+
         Log.d(TAG, "Service Created. Initial state: ${connectionState.value}")
 
         // Load initial history from disk
         loadEventHistory()
 
-        // Start the sequential packet processing daemon
+        // Start listening to inbound notifications for stream processing
         serviceScope.launch {
-            for (data in inboundPacketChannel) {
-                processSinglePacket(data)
+            for (packet in transport.inboundPackets) {
+                handleStreamPacket(packet)
             }
         }
     }
@@ -214,17 +237,6 @@ class OuraBleService : Service() {
         }
     }
 
-    private fun hexStringToByteArray(s: String): ByteArray {
-        val len = s.length
-        val data = ByteArray(len / 2)
-        var i = 0
-        while (i < len) {
-            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
-            i += 2
-        }
-        return data
-    }
-
     override fun onBind(intent: Intent?): IBinder {
         return binder
     }
@@ -240,30 +252,15 @@ class OuraBleService : Service() {
             return
         }
 
-        if (bluetoothAdapter == null) {
-            updateConnectionState(ConnectionState.Failed("Bluetooth unsupported"), "No BT Adapter")
-            return
-        }
+        val keyHex = byteArrayToHexString(authKey)
+        credentialStore.saveCredentials(sanitizedMac, keyHex)
+        credentialStore.setPairingVerified(true)
 
-        // Audit Log: Verify MAC and Key integrity (Log first 4 bytes of key only)
-        val keySnippet = authKey.take(4).joinToString("") { "%02x".format(it) }
-        Log.i(TAG, "◆ [CONN ATTEMPT] Target: $sanitizedMac | Key Prefix: $keySnippet... | Size: ${authKey.size}")
+        val snippet = authKey.take(4).joinToString("") { "%02x".format(it) }
+        Log.i(TAG, "◆ [CONN ATTEMPT] Target: $sanitizedMac | Key Prefix: $snippet... | Size: ${authKey.size}")
 
-        activeKey = authKey
-        isPairingFlow = false
-        val device = bluetoothAdapter!!.getRemoteDevice(sanitizedMac)
-
-        updateConnectionState(ConnectionState.Connecting, "Manual connection started for $sanitizedMac")
         updateNotification("Connecting to Oura Ring...")
-
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            bluetoothGatt = device.connectGatt(
-                applicationContext,
-                false,
-                gattCallback,
-                BluetoothDevice.TRANSPORT_LE
-            )
-        }
+        transport.connect(sanitizedMac, isPairing = false)
     }
 
     /**
@@ -277,435 +274,101 @@ class OuraBleService : Service() {
             return
         }
 
-        if (bluetoothAdapter == null) {
-            updateConnectionState(ConnectionState.Failed("Bluetooth unsupported"), "No BT Adapter")
-            return
-        }
+        // Defer credentialStore persistence until setup handshake is confirmed (Key Erasure Fix)
+        pendingPairingMac = sanitizedMac
+        pendingPairingKey = generatedKey
 
-        // Audit Log: Verify generated key integrity
-        val keySnippet = generatedKey.take(4).joinToString("") { "%02x".format(it) }
-        Log.i(TAG, "◆ [PAIR ATTEMPT] Target: $sanitizedMac | New Key Prefix: $keySnippet... | Size: ${generatedKey.size}")
+        val snippet = generatedKey.take(4).joinToString("") { "%02x".format(it) }
+        Log.i(TAG, "◆ [PAIR ATTEMPT] Target: $sanitizedMac | Pending Key Prefix: $snippet... | Size: ${generatedKey.size}")
 
-        activeKey = generatedKey
-        isPairingFlow = true
-        val device = bluetoothAdapter!!.getRemoteDevice(sanitizedMac)
-
-        updateConnectionState(ConnectionState.Connecting, "Pairing sequence started for $sanitizedMac")
         updateNotification("Pairing with Oura Ring...")
-
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            bluetoothGatt = device.connectGatt(
-                applicationContext,
-                false,
-                gattCallback,
-                BluetoothDevice.TRANSPORT_LE
-            )
-        }
+        transport.connect(sanitizedMac, isPairing = true)
     }
 
     fun disconnect() {
-        bluetoothGatt?.disconnect()
-        bluetoothGatt?.close()
-        bluetoothGatt = null
-        writeCharacteristic = null
-        updateConnectionState(ConnectionState.Idle, "Disconnect invoked")
+        transport.disconnect()
         updateNotification("Disconnected")
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                val errorCode = "GATT Error $status"
-                Log.e(TAG, errorCode)
-                updateConnectionState(ConnectionState.Failed(errorCode), "GATT error callback")
-                disconnect()
+    private suspend fun runSetupFlow(isPairing: Boolean) {
+        val key: ByteArray
+        val mac: String
+
+        if (isPairing && pendingPairingKey != null && pendingPairingMac != null) {
+            key = pendingPairingKey!!
+            mac = pendingPairingMac!!
+        } else {
+            val keyHex = credentialStore.getSavedKeyHex()
+            val savedMac = credentialStore.getSavedMacAddress()
+            if (keyHex == null || savedMac == null) {
+                updateConnectionState(ConnectionState.Failed("No saved key"), "Missing credentials")
                 return
             }
-
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d(TAG, "GATT connected, discovering services...")
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                Log.d(TAG, "GATT disconnected")
-                updateConnectionState(ConnectionState.Idle, "GATT disconnected callback")
-                disconnect()
-            }
+            key = hexStringToByteArray(keyHex)
+            mac = savedMac
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                val service = gatt.getService(OuraGATT.SERVICE_UUID)
-                if (service != null) {
-                    val notifyChar = service.getCharacteristic(OuraGATT.NOTIFY_CHAR_UUID)
-                    writeCharacteristic = service.getCharacteristic(OuraGATT.WRITE_CHAR_UUID)
-
-                    if (notifyChar != null && writeCharacteristic != null) {
-                        Log.d(TAG, "Characteristics found, enabling notifications...")
-                        gatt.setCharacteristicNotification(notifyChar, true)
-
-                        // Enable local notification description
-                        val descriptor = notifyChar.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-                        descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(descriptor)
-                    } else {
-                        Log.e(TAG, "Oura characteristics not found")
-                        updateConnectionState(ConnectionState.Failed("Unsupported ring firmware"), "Missing Oura Characteristics")
-                    }
-                } else {
-                    Log.e(TAG, "Oura GATT service not found")
-                    updateConnectionState(ConnectionState.Failed("Not an Oura ring"), "Missing Oura Service UUID")
+        if (isPairing) {
+            val success = authenticator.runPairingHandshake(key, transport)
+            if (success) {
+                // Connection successfully paired, persist credentials now (Key Erasure Fix)
+                credentialStore.saveCredentials(mac, byteArrayToHexString(key))
+                credentialStore.setPairingVerified(true)
+                val authSuccess = authenticator.runAuthentication(key, transport)
+                if (authSuccess) {
+                    onAuthSuccess()
                 }
             } else {
-                Log.e(TAG, "Service discovery failed with status $status")
-                updateConnectionState(ConnectionState.Failed("Discovery failed"), "GATT discovery error $status")
-            }
-        }
-
-        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "Notification descriptor enabled, starting authentication...")
-                serviceScope.launch {
-                    if (isPairingFlow) {
-                        runPairingHandshake()
-                    } else {
-                        runAuthentication()
-                    }
+                Log.w(TAG, "Pairing handshake failed/ignored, falling back to standard authentication (key may already exist)")
+                val authSuccess = authenticator.runAuthentication(key, transport)
+                if (authSuccess) {
+                    // Ring already has this key, persist credentials now (Key Erasure Fix)
+                    credentialStore.saveCredentials(mac, byteArrayToHexString(key))
+                    credentialStore.setPairingVerified(true)
+                    onAuthSuccess()
+                } else {
+                    updateConnectionState(ConnectionState.Failed("Authentication failed"), "Pairing & standard auth both failed")
                 }
             }
-        }
-
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-            inboundPacketChannel.trySend(value.clone())
-        }
-
-        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e(TAG, "Failed to write characteristic: status $status")
+            // Clean up temporary pending contexts
+            pendingPairingKey = null
+            pendingPairingMac = null
+        } else {
+            val authSuccess = authenticator.runAuthentication(key, transport)
+            if (authSuccess) {
+                onAuthSuccess()
             }
         }
     }
 
-    private suspend fun runPairingHandshake() {
-        val key = activeKey ?: return
-        updateConnectionState(ConnectionState.Authenticating, "Descriptor write success, starting pairing")
-        _syncProgress.value = "Installing auth key..."
+    private suspend fun onAuthSuccess() {
+        updateConnectionState(ConnectionState.Ready, "Authentication verified successfully")
+        _syncProgress.value = null
+        updateNotification("OpenOura: Synced and running")
 
-        // Write the generated 16-byte key to the ring
-        val pairPacket = Req.setAuthKey(key)
-        writeRaw(pairPacket)
+        // Read metadata
+        val meta = controller.readDeviceMetadata(transport)
+        _deviceMetadata.value = meta
 
-        val response = waitForPacket { it.tag == 0x25.toByte() }
-        if (response != null && response.payload.isNotEmpty() && response.payload[0] == 0x00.toByte()) {
-            Log.d(TAG, "Auth key installed successfully, running standard authentication...")
-            isPairingFlow = false
-            runAuthentication()
-        } else {
-            val errCode = if (response != null && response.payload.isNotEmpty()) "0x${"%02x".format(response.payload[0])}" else "timeout"
-            Log.e(TAG, "Pairing rejected by the ring: $errCode")
-            updateConnectionState(ConnectionState.Failed("Pairing rejected ($errCode)"), "Ring rejected 0x25 pairing packet")
-        }
-    }
-
-    private suspend fun runAuthentication() {
-        val key = activeKey ?: return
-        updateConnectionState(ConnectionState.Authenticating, "Starting auth nonce request")
-        _syncProgress.value = "Requesting auth nonce..."
-
-        writeRaw(Req.authNonce)
-
-        // Nonce is 0x2f type 0x01. Extended tag is 0x2c.
-        val noncePkt = waitForPacket { it.tag == 0x2f.toByte() && it.payload.isNotEmpty() && it.payload[0] == 0x2c.toByte() }
-        if (noncePkt == null || noncePkt.payload.size <= 1) {
-            updateConnectionState(ConnectionState.Failed("Auth failed (no nonce)"), "Timed out or empty nonce packet")
-            return
-        }
-
-        // Extracted nonce is payload excluding the extended tag 0x2c
-        val nonce = noncePkt.payload.copyOfRange(1, noncePkt.payload.size)
-        
-        Log.d(TAG, "FFI: Encrypting nonce. Key size: ${key.size}, Nonce size: ${nonce.size}")
-        val encrypted = OuraFfiBridge.encryptNonce(key, nonce)
-        if (encrypted == null) {
-            updateConnectionState(ConnectionState.Failed("Crypto error"), "Rust FFI encryption failed")
-            return
-        }
-
-        _syncProgress.value = "Verifying auth key..."
-        writeRaw(Req.authenticate(encrypted))
-
-        val authResp = waitForPacket { it.tag == 0x2f.toByte() && it.payload.size > 1 && it.payload[0] == 0x2e.toByte() }
-        if (authResp != null && authResp.payload.size > 1 && authResp.payload[1] == 0x00.toByte()) {
-            Log.d(TAG, "Authentication successful!")
-            updateConnectionState(ConnectionState.Ready, "Auth packet 0x2e verified 0x00")
-            _syncProgress.value = null
-            updateNotification("OpenOura: Synced and running")
-
-            // Read device info
-            readDeviceInfo()
-
-            // F-4.5: Live HR flow setup
-            try {
-                writeRaw(Req.setNotification(0x3f.toByte()))
-                writeRaw(Req.setFeatureMode(OuraGATT.FEATURE_DAYTIME_HR, OuraGATT.FEATURE_MODE_CONNECTED_LIVE))
-                Log.d(TAG, "Sent Live HR activation packets (setNotification(0x3f) and setFeatureMode(DAYTIME_HR, CONNECTED_LIVE))")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to send Live HR activation packets: ${e.message}", e)
-            }
-        } else {
-            val errCode = if (authResp != null && authResp.payload.size > 1) "0x${"%02x".format(authResp.payload[1])}" else "Unknown"
-            updateConnectionState(ConnectionState.Failed("Wrong auth key ($errCode)"), "Ring rejected encrypted nonce")
-        }
-    }
-
-    private suspend fun readDeviceInfo() {
-        // Read battery
-        writeRaw(Req.battery)
-        val batPkt = waitForPacket { it.tag == 0x0d.toByte() }
-        var batteryPct = 50
-        var isCharging = false
-        if (batPkt != null && batPkt.payload.size >= 3) {
-            batteryPct = batPkt.payload[0].toInt() and 0xff
-            isCharging = batPkt.payload[1] > 0
-        }
-
-        // Read firmware
-        writeRaw(Req.firmware)
-        val fwPkt = waitForPacket { it.tag == 0x09.toByte() }
-        var firmware = "Unknown"
-        if (fwPkt != null && fwPkt.payload.size >= 6) {
-            firmware = "${fwPkt.payload[3]}.${fwPkt.payload[4]}.${fwPkt.payload[5]}"
-        }
-
-        _deviceMetadata.value = OuraDeviceMetadata(
-            firmware = firmware,
-            batteryPercent = batteryPct,
-            isCharging = isCharging
-        )
+        // Setup Live HR
+        controller.setupLiveHr(transport)
     }
 
     /**
-     * Pull history events incrementally from the ring and write to Health Connect.
+     * Trigger Incremental History Sync.
      */
     suspend fun syncHistory() {
-        if (_connectionState.value != ConnectionState.Ready) {
+        if (connectionState.value != ConnectionState.Ready) {
             Log.w(TAG, "Cannot sync: device not ready")
             return
         }
-
-        _syncProgress.value = "Starting history sync..."
-        val sharedPrefs = getSharedPreferences("open_oura_prefs", Context.MODE_PRIVATE)
-        var cursor = sharedPrefs.getInt("sync_cursor", 0)
-
-        Log.d(TAG, "Syncing from cursor: $cursor")
-
-        val newEvents = mutableListOf<String>()
-        var bytesLeft = 1
-        var maxTs = cursor.toLong()
-
-        // Loop until there are no bytes left to read
-        while (bytesLeft > 0) {
-            _syncProgress.value = "Syncing events (cursor $cursor)..."
-
-            val batch = getEventBatch(cursor)
-            if (batch.events.isEmpty() && batch.bytesLeft == 0) {
-                break
-            }
-
-            for (p in batch.events) {
-                if (p.payload.size < 4) continue
-                // Parse timestamp (4 bytes LE)
-                val ts = ((p.payload[0].toInt() and 0xff) or
-                          ((p.payload[1].toInt() and 0xff) shl 8) or
-                          ((p.payload[2].toInt() and 0xff) shl 16) or
-                          ((p.payload[3].toInt() and 0xff) shl 24)).toLong() and 0xffffffffL
-
-                if (ts > maxTs) {
-                    maxTs = ts
-                }
-
-                // Decode event body
-                val body = p.payload.copyOfRange(4, p.payload.size)
-                val decodedJson = OuraFfiBridge.decodeEvent(p.tag, body) ?: continue
-
-                // Construct event JSON
-                val eventObj = JSONObject().apply {
-                    put("tag", p.tag.toInt() and 0xff)
-                    put("timestamp", ts)
-                    put("name", OuraFfiBridge.getEventName(p.tag))
-                    put("decoded", JSONObject(decodedJson))
-                }
-                newEvents.add(eventObj.toString())
-            }
-
-            bytesLeft = batch.bytesLeft
-            val nextCursor = (maxTs + 1).toInt()
-            if (nextCursor > cursor) {
-                cursor = nextCursor
-            } else {
-                break // Prevents infinite loop if cursor is not advancing
-            }
-        }
-
-        // Save new events to oura_history.json
-        if (newEvents.isNotEmpty()) {
-            saveEventsToFile(newEvents)
-            // Update in-memory event history flow
-            _decodedEventHistory.value = _decodedEventHistory.value + newEvents
-
-            // Save updated cursor
-            sharedPrefs.edit().putInt("sync_cursor", cursor).apply()
-
-            // Push to Health Connect
-            _syncProgress.value = "Pushing to Health Connect..."
-            HealthConnectManager.syncEventsToHealthConnect(this, newEvents)
-        }
-
-        _syncProgress.value = null
-        Log.d(TAG, "Sync complete. Next cursor: $cursor")
-    }
-
-    private suspend fun getEventBatch(start: Int): EventBatch {
-        val evs = mutableListOf<Packet>()
-        var bytesLeft = 0
-        var finished = false
-        val job = Job()
-
-        val listener = { p: Packet ->
-            if (p.tag == 0x11.toByte()) {
-                if (p.payload.size >= 6) {
-                    bytesLeft = ((p.payload[2].toInt() and 0xff) or
-                                 ((p.payload[3].toInt() and 0xff) shl 8) or
-                                 ((p.payload[4].toInt() and 0xff) shl 16) or
-                                 ((p.payload[5].toInt() and 0xff) shl 24))
-                }
-                finished = true
-                job.complete()
-                true
-            } else if (p.tag >= OuraGATT.HISTORY_EVENT_PREFIX) {
-                evs.add(p)
-                false
-            } else {
-                false
-            }
-        }
-
-        synchronized(responseListeners) {
-            responseListeners.add(listener)
-        }
-
-        // Request events
-        writeRaw(Req.getEvent(start, 255.toByte(), -1))
-
-        try {
-            kotlinx.coroutines.withTimeout(2000) {
-                job.join()
-            }
-        } catch (e: Exception) {
-            synchronized(responseListeners) {
-                responseListeners.remove(listener)
-            }
-        }
-
-        return EventBatch(evs, bytesLeft)
-    }
-
-    private fun saveEventsToFile(eventsJson: List<String>) {
-        try {
-            val file = File(filesDir, "oura_history.json")
-            val existingEvents = mutableListOf<String>()
-
-            // Load existing
-            if (file.exists()) {
-                val content = file.readText()
-                val jsonArray = JSONArray(content)
-                for (i in 0 until jsonArray.length()) {
-                    existingEvents.add(jsonArray.getString(i))
-                }
-            }
-
-            // Append new
-            existingEvents.addAll(eventsJson)
-
-            // Truncate to last 100,000 to prevent infinite file size growth
-            val targetList = if (existingEvents.size > 100000) {
-                existingEvents.takeLast(100000)
-            } else {
-                existingEvents
-            }
-
-            val finalArray = JSONArray(targetList)
-            FileWriter(file).use { writer ->
-                writer.write(finalArray.toString())
-            }
-            Log.d(TAG, "Saved ${eventsJson.size} events. Total cached: ${targetList.size}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to save events to file: ${e.message}", e)
-        }
-    }
-
-    private data class EventBatch(
-        val events: List<Packet>,
-        val bytesLeft: Int
-    )
-
-    /**
-     * Write raw bytes to the write characteristic.
-     */
-    private fun writeRaw(data: ByteArray) {
-        val gatt = bluetoothGatt ?: return
-        val char = writeCharacteristic ?: return
-        char.value = data
-        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        gatt.writeCharacteristic(char)
-    }
-
-    /**
-     * Sequential packet reassembly and dispatch.
-     */
-    private suspend fun processSinglePacket(data: ByteArray) {
-        notificationBuffer += data
-
-        while (notificationBuffer.size >= 2) {
-            val tag = notificationBuffer[0]
-            val len = notificationBuffer[1].toInt() and 0xff
-            val totalExpected = 2 + len
-
-            if (notificationBuffer.size >= totalExpected) {
-                val fullPacketBytes = notificationBuffer.copyOfRange(0, totalExpected)
-                notificationBuffer = notificationBuffer.copyOfRange(totalExpected, notificationBuffer.size)
-
-                val packet = Packet.parse(fullPacketBytes)
-                if (packet != null) {
-                    Log.d(TAG, "Parsed packet: tag=${packet.tag}, extTag=${packet.extTag}")
-                    // Dispatch to transactional listeners
-                    synchronized(responseListeners) {
-                        val iterator = responseListeners.iterator()
-                        while (iterator.hasNext()) {
-                            val listener = iterator.next()
-                            if (listener(packet)) {
-                                iterator.remove()
-                            }
-                        }
-                    }
-
-                    // Process stream packets (e.g. ACM Live Data)
-                    handleStreamPacket(packet)
-                }
-            } else {
-                break
-            }
-        }
-    }
-
-    private fun handleCompletePayload(completeFrame: ByteArray) {
-        // This method is now integrated into processSinglePacket for simplicity in the 2-byte protocol
+        historySyncManager.syncHistory(transport)
     }
 
     private fun handleStreamPacket(packet: Packet) {
         if (packet.tag == OuraGATT.REALTIME_ACM_RESPONSE_TAG) {
-            // Reconstruct G-force or BPM if live HR notifications arrive
             val p = packet.payload
-            if (p.size >= 10 && p[0] == 0x20.toByte()) { // ACM data
+            if (p.size >= 10 && p[0] == 0x20.toByte()) {
                 fun s(o: Int): Short {
                     return ((p[o].toInt() and 0xff) or ((p[o + 1].toInt() and 0xff) shl 8)).toShort()
                 }
@@ -716,35 +379,6 @@ class OuraBleService : Service() {
                 Log.d(TAG, "Live motion: $g g")
             }
         }
-    }
-
-    private suspend fun waitForPacket(timeoutMs: Long = 3000, condition: (Packet) -> Boolean): Packet? {
-        var result: Packet? = null
-        val job = Job()
-        val listener = { packet: Packet ->
-            if (condition(packet)) {
-                result = packet
-                job.complete()
-                true
-            } else {
-                false
-            }
-        }
-
-        synchronized(responseListeners) {
-            responseListeners.add(listener)
-        }
-
-        try {
-            kotlinx.coroutines.withTimeout(timeoutMs) {
-                job.join()
-            }
-        } catch (e: Exception) {
-            synchronized(responseListeners) {
-                responseListeners.remove(listener)
-            }
-        }
-        return result
     }
 
     private fun createNotificationChannel() {
@@ -770,6 +404,21 @@ class OuraBleService : Service() {
     private fun updateNotification(content: String) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(NOTIFICATION_ID, createNotification(content))
+    }
+
+    private fun hexStringToByteArray(s: String): ByteArray {
+        val len = s.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
+            i += 2
+        }
+        return data
+    }
+
+    private fun byteArrayToHexString(bytes: ByteArray): String {
+        return bytes.joinToString("") { "%02x".format(it) }
     }
 
     override fun onDestroy() {

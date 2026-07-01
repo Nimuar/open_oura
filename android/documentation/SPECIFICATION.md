@@ -23,6 +23,10 @@ This document specifies the requirements, functional components, and success cri
 *   **F-2.8**: Expose audit logs showing MAC address normalizations and the first 4 bytes of cryptographic keys upon connection startup to troubleshoot storage desync.
 *   **F-2.9**: Outbound request packages in `Req` must construct frames using pre-allocated `ByteBuffer` buffers to optimize memory and minimize GC allocation pressure.
 *   **F-2.10**: Declare all raw byte constants (e.g. `CMD_AUTH_NONCE`, `TAG_TIME_SYNC`) explicitly to eliminate magic numbers from the protocol definition.
+*   **F-2.11**: The dashboard "Last Synced Events" list must filter out diagnostic/telemetry event tags `0x43` (`debug_event`) and `0x61` (`debug_data`) to prevent system logs from obscuring biometric summaries in the UI.
+*   **F-2.12**: The Health Connect ingestion layer (`HealthConnectManager`) must support parsing heart rate and HRV samples from extended tags `0x55` (`sleep_heart_rate`), `0x71` (`green_ibi_and_amplitude_event`), and `0x6e` (`spo2_ibi_and_amplitude_event`) as they become decoded by the Rust core to ensure compatibility with newer ring firmware.
+*   **F-2.13**: The setup coordinator (`runSetupFlow`) must implement a fallback mechanism: if the initial `0x24` (`SetAuthKey`) pairing handshake fails or times out, it must attempt standard `0x2f` challenge-response authentication before declaring a failure, avoiding lockout when pairing a pre-keyed ring.
+*   **F-2.14**: ViewModels must force-push the current connection state (`OuraBleService.connectionState.value`) immediately on service binding (`onServiceConnected`) to resolve UI update race conditions.
 
 ---
 

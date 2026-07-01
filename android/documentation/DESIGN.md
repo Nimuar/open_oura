@@ -85,10 +85,19 @@ while (notificationBuffer.size >= 2) {
 }
 ```
 
-### 3.2 Daytime Live HR Activation (F-4.5)
+### 3.2 Daytime Live HR Activation & Extended Tag Ingestion (F-4.5, F-2.12)
 To force the ring to actively collect and log daytime heart rate metrics, `OuraBleService` writes target GATT feature toggles right after authentication succeeds:
 1. **Notification Subscription:** Write `SetNotification(0x3f)` to listen to heart rate update alerts.
 2. **Feature Mode Setup:** Write `SetFeatureMode(FEATURE_DAYTIME_HR, FEATURE_MODE_CONNECTED_LIVE)` to put the wearable in active realtime logging mode.
+
+#### Biometric Data Ingestion Tags
+To prevent data loss on newer ring models, `HealthConnectManager` must ingest heart rate and HRV samples from multiple biometric data tags decoded by the Rust core, including:
+*   `0x80` (`green_ibi_quality_event`) - Raw green-LED daytime HR.
+*   `0x60` (`ibi_and_amplitude_event`) - Classic infrared daytime HR.
+*   `0x5d` (`hrv_event`) - 5-minute averaged night heart rate and HRV.
+*   `0x55` (`sleep_heart_rate`) - Sleep heart rate records.
+*   `0x71` (`green_ibi_and_amplitude_event`) - Combined green LED HR.
+*   `0x6e` (`spo2_ibi_and_amplitude_event`) - SpO2 heart rate metrics.
 
 ---
 
@@ -133,7 +142,7 @@ To facilitate debugging without relying on logcat or USB connections, the app ex
 
 1. **Thread-Safe Log Queue:** A bounded `lazy_static` logging queue (`Mutex<VecDeque<String>>`) capped at 500 lines is implemented inside the Rust FFI library. FFI methods record operational events here.
 2. **Bulk Log Drainage:** A periodic coroutine in `MainScreenViewModel` invokes `oura_drain_diagnostics()` every 500ms, retrieving a bulk JSON-serialized array of all accumulated logs in a single FFI call. This eliminates lock-contention overhead on the native mutex and prevents queue overflow during data sync bursts.
-3. **Decoded Event History:** Successfully decoded biometric events are committed to a local file (`oura_history.json`) and displayed in a dashboard card showing the last 3 events with their human-readable tags and raw Unix timestamps.
+3. **Decoded Event History & UI Filtering (F-2.11):** Successfully decoded biometric events are committed to a local file (`oura_history.json`). The dashboard displays the most recent 3 decoded events. To prevent diagnostic telemetry packets from pushing user health summaries out of view, system tags `0x43` (`debug_event`) and `0x61` (`debug_data`) are explicitly filtered out from the Compose history card.
 
 ---
 
@@ -153,6 +162,6 @@ To speed up local development builds and bypass multi-ABI cross-compilation over
 To prevent persistent background crash loops and state-machine oscillations:
 1. **Case Normalization:** All MAC addresses retrieved from `SharedPreferences` or incoming Companion Device Manager associations are automatically normalized to uppercase using `.uppercase()` at all retrieval and storage entry points.
 2. **State-Gating:** Auto-reconnection and post-rebirth recovery loops are strictly gated by `OuraBleService.connectionState` (requiring `ConnectionState.Idle`, or `Scanning` for the picker recovery block to prevent deadlocks). If a connection attempt transitions to `Failed`, the state machine halts further pairing and connection triggers until the user manually triggers a sync or resets pairing credentials.
-3. **Persistent Handshake Alignment:** Instead of using volatile, in-memory pairing states (which are vulnerable to race conditions when UI recreation occurs during the Companion picker transition), the app persists the credentials immediately and tracks verification state via a `pairing_verified` storage flag. Upon service binding, if a pairing is present but unverified, the ViewModel forces a service reset and triggers the pairing sequence (`pairNewRing`) synchronously. Once authentication succeeds and the state reaches `Ready`, the `pairing_verified` flag is set, enabling subsequent auto-reconnection routines. To avoid race conditions, the UI flow collector synchronously pulls the absolute service state immediately upon channel connection, and the association trigger clears any residual scan states by forcing the local state flow to `Idle`.
+3. **Persistent Handshake Alignment & Handshake Fallback (F-2.13, F-2.14):** Instead of using volatile, in-memory pairing states (which are vulnerable to race conditions when UI recreation occurs during the Companion picker transition), the app persists the credentials immediately and tracks verification state via a `pairing_verified` storage flag. Upon service binding, if a pairing is present but unverified, the ViewModel forces a service reset and triggers the pairing sequence (`pairNewRing`) synchronously. Once authentication succeeds and the state reaches `Ready`, the `pairing_verified` flag is set, enabling subsequent auto-reconnection routines. To avoid race conditions, the UI flow collector synchronously pulls the absolute service state immediately upon channel connection (`onServiceConnected` in the ViewModel), and the association trigger clears any residual scan states by forcing the local state flow to `Idle`. If the user attempts pairing with a ring that already has an active cryptographic key (so command `0x24` / `SetAuthKey` times out or is ignored), `runSetupFlow` automatically falls back to standard `0x2f` challenge-response authentication.
 4. **Deduplicated Data Stream:** The app processes incoming Bluetooth data strictly through single, unified GATT characteristic notification pathways. Redundant callback registrations are pruned to prevent ghost duplicate packets from corrupting the sequential queue.
 5. **Pairing Retry Limits:** To prevent infinite background loops during a key desynchronization event or handshake rejection, the `MainScreenViewModel` tracks a `pairingAttemptCount` (reset to `0` upon reaching `Ready`). Auto-recovery and retry attempts are capped at a maximum of `3` failures, after which the app stands down to a permanent `Failed` state until a user manually restarts scanning.

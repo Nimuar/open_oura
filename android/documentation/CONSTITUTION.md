@@ -15,6 +15,7 @@ The foundational rules that govern all code generation in this project:
   3. Kotlin wrapper + Android service stub
 - **Article VIII: Anti-Abstraction**: Directly expose standard JNA types and Android Bluetooth/WorkManager structures. Do not add complex lifecycle abstractions.
 - **Article IX: Real-Byte Verification**: Tests must use real event frames captured from hardware or documented in tests (e.g. `green_ibi_quality_event` raw packet data).
+- **Article X: Separation of Concerns & Modular Subsystems**: The Kotlin codebase must strictly segregate transport layers (GATT callbacks), authentication logic (key handshakes), database sync cycles (cursor loops), and high-level device controller commands into decoupled subsystems, keeping the main background service as a thin, orchestration-only coordinator.
 
 ## Technology Stack
 - **Languages**: Rust (edition 2021), Kotlin (1.9+)

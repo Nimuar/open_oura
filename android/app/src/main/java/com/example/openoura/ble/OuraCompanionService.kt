@@ -3,14 +3,10 @@ package com.example.openoura.ble
 import android.annotation.SuppressLint
 import android.companion.AssociationInfo
 import android.companion.CompanionDeviceService
-import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
-import com.example.openoura.ble.ConnectionState
-import com.example.openoura.ble.OuraBleService
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKeys
+import com.example.openoura.ble.auth.CredentialStore
 
 /**
  * Listens to OS-level CompanionDeviceManager range detection signals,
@@ -32,8 +28,8 @@ class OuraCompanionService : CompanionDeviceService() {
 
         Log.d(TAG, "Oura Ring detected nearby: $deviceAddress. Triggering sync...")
 
-        val sharedPrefs = getSharedPreferences("open_oura_prefs", Context.MODE_PRIVATE)
-        val savedMac = sharedPrefs.getString("ring_mac", null)
+        val credentialStore = CredentialStore(this)
+        val savedMac = credentialStore.getSavedMacAddress()
 
         if (savedMac != null && savedMac.equals(deviceAddress, ignoreCase = true)) {
             // Check if the service is already busy with a connection (e.g. from the UI)
@@ -43,31 +39,19 @@ class OuraCompanionService : CompanionDeviceService() {
                 return
             }
 
-            try {
-                val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
-                val securePrefs = EncryptedSharedPreferences.create(
-                    "oura_secure_prefs",
-                    masterKeyAlias,
-                    this,
-                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-                )
-                val keyHex = securePrefs.getString("ring_key", null)
-                if (keyHex != null) {
-                    // Start OuraBleService to execute a target sync loop and stop
-                    val intent = Intent(this, OuraBleService::class.java).apply {
-                        putExtra("mac_address", savedMac)
-                        putExtra("auth_key_hex", keyHex)
-                        putExtra("trigger_sync_and_stop", true)
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(intent)
-                    } else {
-                        startService(intent)
-                    }
+            val keyHex = credentialStore.getSavedKeyHex()
+            if (keyHex != null) {
+                // Start OuraBleService to execute a target sync loop and stop
+                val intent = Intent(this, OuraBleService::class.java).apply {
+                    putExtra("mac_address", savedMac)
+                    putExtra("auth_key_hex", keyHex)
+                    putExtra("trigger_sync_and_stop", true)
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to read credentials on Companion wakeup: ${e.message}", e)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                } else {
+                    startService(intent)
+                }
             }
         }
     }

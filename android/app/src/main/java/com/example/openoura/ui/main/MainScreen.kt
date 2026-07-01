@@ -237,34 +237,48 @@ fun MainScreen(
 
         // Event History Card
         if (eventHistory.isNotEmpty()) {
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
-                    Text(
-                        text = "Synced Event History (${eventHistory.size} total)",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
+            val filteredHistory = remember(eventHistory) {
+                eventHistory.filter { eventStr ->
+                    try {
+                        val obj = JSONObject(eventStr)
+                        val tag = obj.optInt("tag", -1)
+                        tag != 0x43 && tag != 0x61
+                    } catch (e: Exception) {
+                        true
+                    }
+                }
+            }
 
-                    // Show the last 3 events
-                    eventHistory.takeLast(3).reversed().forEach { eventStr ->
-                        var displayStr = "• Raw event (malformed)"
-                        try {
-                            val json = JSONObject(eventStr)
-                            val name = json.optString("name", "Unknown")
-                            val tag = json.optInt("tag")
-                            val ts = json.optLong("timestamp")
-                            displayStr = "• $name (Tag: 0x${Integer.toHexString(tag)}, TS: $ts)"
-                        } catch (e: Exception) {
-                            // Keep default malformed text
-                        }
+            if (filteredHistory.isNotEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
                         Text(
-                            text = displayStr,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(bottom = 4.dp)
+                            text = "Synced Event History (${filteredHistory.size} total)",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp,
+                            modifier = Modifier.padding(bottom = 8.dp)
                         )
+
+                        // Show the last 3 events
+                        filteredHistory.takeLast(3).reversed().forEach { eventStr ->
+                            var displayStr = "• Raw event (malformed)"
+                            try {
+                                val json = JSONObject(eventStr)
+                                val name = json.optString("name", "Unknown")
+                                val tag = json.optInt("tag")
+                                val ts = json.optLong("timestamp")
+                                displayStr = "• $name (Tag: 0x${Integer.toHexString(tag)}, TS: $ts)"
+                            } catch (e: Exception) {
+                                // Keep default malformed text
+                            }
+                            Text(
+                                text = displayStr,
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                        }
                     }
                 }
             }
