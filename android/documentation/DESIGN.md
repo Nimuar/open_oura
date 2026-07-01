@@ -23,6 +23,15 @@ To simplify lifecycle management and eliminate concurrency bugs, **no asynchrono
 1. All network, scheduling, and BLE transport routines are implemented natively in Kotlin.
 2. The Rust library acts as a pure, synchronous decoder and cryptor.
 
+### 1.2 Subsystem Decomposition (Modular Architecture)
+To scale beyond the MVP, the BLE management layer is decoupled into isolated subsystems:
+*   **Transport Subsystem (`transport/`)**: `BleTransportEngine` manages the `BluetoothGatt` lifecycle and connection state transitions. It streams raw callbacks into the `PacketReassembler`, which reassembles native 2-byte packet buffers sequentially.
+*   **Authentication Subsystem (`auth/`)**: `OuraAuthenticator` isolates cryptographic nonces, FFI encryption handshakes, and credential verification checks from raw Bluetooth callbacks. `CredentialStore` wraps keystore-backed preferences.
+*   **Sync Subsystem (`sync/`)**: `HistorySyncManager` manages history sync loops and cursor tracking. It delegates clock drift offsets to `DriftCalibrator` and commits calibrated event records to `HealthConnectManager`.
+*   **Controller Subsystem (`controller/`)**: `OuraController` exposes type-safe outbound commands (such as Live HR activation, Flight Mode, and Factory Reset), shielding the application from raw characteristic writes.
+*   **Thin Coordinator (`OuraBleService.kt`)**: Focuses strictly on foreground service notification rules, CDM proximity bindings, and OS-level entry hooks.
+*   **JNA Testability Wrapper**: The native JNA library is wrapped behind the `OuraFfiWrapper` interface to decouple upper application layers from host compilation constraints, enabling 100% JVM mock unit tests without native dynamic library loadings.
+
 ---
 
 ## 2. Memory Safety & The JNA FFI Bridge
@@ -53,7 +62,7 @@ fun decodeEvent(tag: Byte, body: ByteArray): String? {
 ### 3.1 Packet Reassembly & Native Framing
 Incoming notification packets arriving over Bluetooth Low Energy (BLE) are structured using a native 2-byte header: `[Tag, Length]`. 
 *   **Tag:** 1 byte representing the event type.
-*   **Length:** 1 byte representing payload size (up to 255 bytes).
+*   **Length:** 1 byte representing payload size (up to 255 bytes). The parser (`Packet.parse`) performs strict validation, returning `null` if the buffer size is less than `2 + len` to fail-fast on incomplete frames and avoid silent data corruption.
 
 `OuraBleService` accumulates notification fragments in `notificationBuffer` and processes complete packets sequentially:
 
@@ -123,7 +132,7 @@ To guarantee the background service does not run indefinitely, `OuraBleService` 
 To facilitate debugging without relying on logcat or USB connections, the app exposes native diagnostics to the user:
 
 1. **Thread-Safe Log Queue:** A bounded `lazy_static` logging queue (`Mutex<VecDeque<String>>`) capped at 500 lines is implemented inside the Rust FFI library. FFI methods record operational events here.
-2. **UI Monospace Log Console:** A periodic coroutine in `MainScreenViewModel` polls `popDiagnostic()` every 500ms, updating a Jetpack Compose state flow. These logs are rendered inside a scrollable dev-console card.
+2. **Bulk Log Drainage:** A periodic coroutine in `MainScreenViewModel` invokes `oura_drain_diagnostics()` every 500ms, retrieving a bulk JSON-serialized array of all accumulated logs in a single FFI call. This eliminates lock-contention overhead on the native mutex and prevents queue overflow during data sync bursts.
 3. **Decoded Event History:** Successfully decoded biometric events are committed to a local file (`oura_history.json`) and displayed in a dashboard card showing the last 3 events with their human-readable tags and raw Unix timestamps.
 
 ---
