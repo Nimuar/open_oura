@@ -50,25 +50,25 @@ fun decodeEvent(tag: Byte, body: ByteArray): String? {
 
 ## 3. BLE Ingestion, Packet Reassembly & Live HR Flow
 
-### 3.1 Packet Reassembly & Extended Framing
-Incoming notification packets arriving over Bluetooth Low Energy (BLE) are structured using an extended 4-byte header: `[Tag, Type, LenMSB, LenLSB]`. 
+### 3.1 Packet Reassembly & Native Framing
+Incoming notification packets arriving over Bluetooth Low Energy (BLE) are structured using a native 2-byte header: `[Tag, Length]`. 
 *   **Tag:** 1 byte representing the event type.
-*   **Type:** 1 byte representing payload classifications.
-*   **Length:** 2 bytes (Big-Endian) representing payload size up to 65,535 bytes (allowing large data pages like Sleep summaries to sync efficiently).
+*   **Length:** 1 byte representing payload size (up to 255 bytes).
 
-`OuraBleService` accumulates notification fragments in `notificationBuffer` and processes complete packets:
+`OuraBleService` accumulates notification fragments in `notificationBuffer` and processes complete packets sequentially:
 
 ```kotlin
-notificationBuffer = notificationBuffer + packet
-while (notificationBuffer.size >= 4) {
-    val tag = notificationBuffer[0].toInt() and 0xFF
-    val type = notificationBuffer[1].toInt() and 0xFF
-    val payloadLength = (notificationBuffer[2].toInt() and 0xFF) or 
-                        ((notificationBuffer[3].toInt() and 0xFF) shl 8)
-    val totalExpectedFrameSize = payloadLength + 4
-    if (notificationBuffer.size >= totalExpectedFrameSize) {
-        val completeFrame = notificationBuffer.copyOfRange(0, totalExpectedFrameSize)
-        notificationBuffer = notificationBuffer.copyOfRange(totalExpectedFrameSize, notificationBuffer.size)
+notificationBuffer += data
+while (notificationBuffer.size >= 2) {
+    val tag = notificationBuffer[0]
+    val len = notificationBuffer[1].toInt() and 0xff
+    val totalExpected = 2 + len
+
+    if (notificationBuffer.size >= totalExpected) {
+        val fullPacketBytes = notificationBuffer.copyOfRange(0, totalExpected)
+        notificationBuffer = notificationBuffer.copyOfRange(totalExpected, notificationBuffer.size)
+
+        val packet = Packet.parse(fullPacketBytes)
         // Parse and handle packet...
     } else {
         break
@@ -145,3 +145,5 @@ To prevent persistent background crash loops and state-machine oscillations:
 1. **Case Normalization:** All MAC addresses retrieved from `SharedPreferences` or incoming Companion Device Manager associations are automatically normalized to uppercase using `.uppercase()` at all retrieval and storage entry points.
 2. **State-Gating:** Auto-reconnection and post-rebirth recovery loops are strictly gated by `OuraBleService.connectionState` (requiring `ConnectionState.Idle`, or `Scanning` for the picker recovery block to prevent deadlocks). If a connection attempt transitions to `Failed`, the state machine halts further pairing and connection triggers until the user manually triggers a sync or resets pairing credentials.
 3. **Persistent Handshake Alignment:** Instead of using volatile, in-memory pairing states (which are vulnerable to race conditions when UI recreation occurs during the Companion picker transition), the app persists the credentials immediately and tracks verification state via a `pairing_verified` storage flag. Upon service binding, if a pairing is present but unverified, the ViewModel forces a service reset and triggers the pairing sequence (`pairNewRing`) synchronously. Once authentication succeeds and the state reaches `Ready`, the `pairing_verified` flag is set, enabling subsequent auto-reconnection routines. To avoid race conditions, the UI flow collector synchronously pulls the absolute service state immediately upon channel connection, and the association trigger clears any residual scan states by forcing the local state flow to `Idle`.
+4. **Deduplicated Data Stream:** The app processes incoming Bluetooth data strictly through single, unified GATT characteristic notification pathways. Redundant callback registrations are pruned to prevent ghost duplicate packets from corrupting the sequential queue.
+5. **Pairing Retry Limits:** To prevent infinite background loops during a key desynchronization event or handshake rejection, the `MainScreenViewModel` tracks a `pairingAttemptCount` (reset to `0` upon reaching `Ready`). Auto-recovery and retry attempts are capped at a maximum of `3` failures, after which the app stands down to a permanent `Failed` state until a user manually restarts scanning.

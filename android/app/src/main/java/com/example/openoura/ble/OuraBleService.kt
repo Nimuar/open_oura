@@ -142,7 +142,7 @@ class OuraBleService : Service() {
         // Start the sequential packet processing daemon
         serviceScope.launch {
             for (data in inboundPacketChannel) {
-                processRawPacket(data)
+                processSinglePacket(data)
             }
         }
     }
@@ -233,16 +233,27 @@ class OuraBleService : Service() {
      * Connect to an already paired ring MAC address.
      */
     fun connectToDevice(macAddress: String, authKey: ByteArray) {
+        val sanitizedMac = macAddress.uppercase()
+        val currentState = connectionState.value
+        if (currentState != ConnectionState.Idle && currentState !is ConnectionState.Failed) {
+            Log.w(TAG, "Ignoring connect request for $sanitizedMac: Already in state $currentState")
+            return
+        }
+
         if (bluetoothAdapter == null) {
             updateConnectionState(ConnectionState.Failed("Bluetooth unsupported"), "No BT Adapter")
             return
         }
 
+        // Audit Log: Verify MAC and Key integrity (Log first 4 bytes of key only)
+        val keySnippet = authKey.take(4).joinToString("") { "%02x".format(it) }
+        Log.i(TAG, "◆ [CONN ATTEMPT] Target: $sanitizedMac | Key Prefix: $keySnippet... | Size: ${authKey.size}")
+
         activeKey = authKey
         isPairingFlow = false
-        val device = bluetoothAdapter!!.getRemoteDevice(macAddress)
+        val device = bluetoothAdapter!!.getRemoteDevice(sanitizedMac)
 
-        updateConnectionState(ConnectionState.Connecting, "Manual connection started for $macAddress")
+        updateConnectionState(ConnectionState.Connecting, "Manual connection started for $sanitizedMac")
         updateNotification("Connecting to Oura Ring...")
 
         android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -259,16 +270,27 @@ class OuraBleService : Service() {
      * Scan and Pair with a factory-reset ring.
      */
     fun pairNewRing(macAddress: String, generatedKey: ByteArray) {
+        val sanitizedMac = macAddress.uppercase()
+        val currentState = connectionState.value
+        if (currentState != ConnectionState.Idle && currentState !is ConnectionState.Failed && currentState != ConnectionState.Scanning) {
+            Log.w(TAG, "Ignoring pairing request for $sanitizedMac: Already in state $currentState")
+            return
+        }
+
         if (bluetoothAdapter == null) {
             updateConnectionState(ConnectionState.Failed("Bluetooth unsupported"), "No BT Adapter")
             return
         }
 
+        // Audit Log: Verify generated key integrity
+        val keySnippet = generatedKey.take(4).joinToString("") { "%02x".format(it) }
+        Log.i(TAG, "◆ [PAIR ATTEMPT] Target: $sanitizedMac | New Key Prefix: $keySnippet... | Size: ${generatedKey.size}")
+
         activeKey = generatedKey
         isPairingFlow = true
-        val device = bluetoothAdapter!!.getRemoteDevice(macAddress)
+        val device = bluetoothAdapter!!.getRemoteDevice(sanitizedMac)
 
-        updateConnectionState(ConnectionState.Connecting, "Pairing sequence started for $macAddress")
+        updateConnectionState(ConnectionState.Connecting, "Pairing sequence started for $sanitizedMac")
         updateNotification("Pairing with Oura Ring...")
 
         android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -356,12 +378,6 @@ class OuraBleService : Service() {
             inboundPacketChannel.trySend(value.clone())
         }
 
-        @Deprecated("Deprecated in Java")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            val data = characteristic.value ?: return
-            inboundPacketChannel.trySend(data.clone())
-        }
-
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "Failed to write characteristic: status $status")
@@ -384,8 +400,9 @@ class OuraBleService : Service() {
             isPairingFlow = false
             runAuthentication()
         } else {
-            Log.e(TAG, "Pairing rejected by the ring")
-            updateConnectionState(ConnectionState.Failed("Pairing rejected (is the ring factory-reset?)"), "Ring rejected 0x25 pairing packet")
+            val errCode = if (response != null && response.payload.isNotEmpty()) "0x${"%02x".format(response.payload[0])}" else "timeout"
+            Log.e(TAG, "Pairing rejected by the ring: $errCode")
+            updateConnectionState(ConnectionState.Failed("Pairing rejected ($errCode)"), "Ring rejected 0x25 pairing packet")
         }
     }
 
@@ -396,7 +413,8 @@ class OuraBleService : Service() {
 
         writeRaw(Req.authNonce)
 
-        val noncePkt = waitForPacket { it.tag == 0x2f.toByte() && it.extTag == 0x2c.toByte() }
+        // Nonce is 0x2f type 0x01. Extended tag is 0x2c.
+        val noncePkt = waitForPacket { it.tag == 0x2f.toByte() && it.payload.isNotEmpty() && it.payload[0] == 0x2c.toByte() }
         if (noncePkt == null || noncePkt.payload.size <= 1) {
             updateConnectionState(ConnectionState.Failed("Auth failed (no nonce)"), "Timed out or empty nonce packet")
             return
@@ -404,6 +422,8 @@ class OuraBleService : Service() {
 
         // Extracted nonce is payload excluding the extended tag 0x2c
         val nonce = noncePkt.payload.copyOfRange(1, noncePkt.payload.size)
+        
+        Log.d(TAG, "FFI: Encrypting nonce. Key size: ${key.size}, Nonce size: ${nonce.size}")
         val encrypted = OuraFfiBridge.encryptNonce(key, nonce)
         if (encrypted == null) {
             updateConnectionState(ConnectionState.Failed("Crypto error"), "Rust FFI encryption failed")
@@ -413,7 +433,7 @@ class OuraBleService : Service() {
         _syncProgress.value = "Verifying auth key..."
         writeRaw(Req.authenticate(encrypted))
 
-        val authResp = waitForPacket { it.tag == 0x2f.toByte() && it.extTag == 0x2e.toByte() }
+        val authResp = waitForPacket { it.tag == 0x2f.toByte() && it.payload.size > 1 && it.payload[0] == 0x2e.toByte() }
         if (authResp != null && authResp.payload.size > 1 && authResp.payload[1] == 0x00.toByte()) {
             Log.d(TAG, "Authentication successful!")
             updateConnectionState(ConnectionState.Ready, "Auth packet 0x2e verified 0x00")
@@ -432,7 +452,8 @@ class OuraBleService : Service() {
                 Log.e(TAG, "Failed to send Live HR activation packets: ${e.message}", e)
             }
         } else {
-            updateConnectionState(ConnectionState.Failed("Wrong authentication key"), "Ring rejected encrypted nonce")
+            val errCode = if (authResp != null && authResp.payload.size > 1) "0x${"%02x".format(authResp.payload[1])}" else "Unknown"
+            updateConnectionState(ConnectionState.Failed("Wrong auth key ($errCode)"), "Ring rejected encrypted nonce")
         }
     }
 
@@ -641,7 +662,7 @@ class OuraBleService : Service() {
     /**
      * Sequential packet reassembly and dispatch.
      */
-    private fun processRawPacket(data: ByteArray) {
+    private suspend fun processSinglePacket(data: ByteArray) {
         notificationBuffer += data
 
         while (notificationBuffer.size >= 2) {
@@ -674,6 +695,10 @@ class OuraBleService : Service() {
                 break
             }
         }
+    }
+
+    private fun handleCompletePayload(completeFrame: ByteArray) {
+        // This method is now integrated into processSinglePacket for simplicity in the 2-byte protocol
     }
 
     private fun handleStreamPacket(packet: Packet) {

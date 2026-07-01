@@ -39,6 +39,9 @@ This specification details the design and requirements for the local-first, head
 - **F-4.3**: Parse and reconstruct fragmented packets if BLE MTU is smaller than packet length.
 - **F-4.4**: Push decoded JSON data into a Jetpack Compose-friendly `StateFlow<List<String>>` or `MutableStateFlow` representing decoded event history.
 - **F-4.5**: Implement the "Live" HR flow: write `SetNotification(0x3f)` and `SetFeatureMode(DAYTIME_HR, CONNECTED_LIVE)` to force the ring to record daytime HR history events (`0x80`).
+- **F-4.6**: Implement connection state-gating inside `OuraBleService` to reject overlapping connection or pairing requests when a GATT session is already in progress.
+- **F-4.7**: Implement safety-gating in `OuraCompanionService` to skip background sync invocations if the service is already busy with an active foreground or background connection.
+- **F-4.8**: Expose audit logs showing MAC address normalizations and the first 4 bytes of cryptographic keys upon connection startup to troubleshoot storage desync.
 
 ## Success Criteria
 1. The compilation script successfully builds `liboura_ffi.so` and places it in the JNI directory.

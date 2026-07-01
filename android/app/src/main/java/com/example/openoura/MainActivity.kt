@@ -24,6 +24,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.core.app.ActivityCompat
 import androidx.lifecycle.ViewModelProvider
+import com.example.openoura.ble.ConnectionState
+import com.example.openoura.ble.OuraBleService
 import com.example.openoura.theme.OpenOuraTheme
 import com.example.openoura.ui.main.MainScreenViewModel
 import java.util.regex.Pattern
@@ -118,6 +120,13 @@ class MainActivity : ComponentActivity() {
      * Checks if a new association was created while the process was dead.
      */
     private fun recoverPostRebirthAssociation() {
+        // Only attempt recovery if the app is currently Idle or Scanning.
+        val state = OuraBleService.connectionState.value
+        if (state != ConnectionState.Idle && state != ConnectionState.Scanning) {
+            Log.d(TAG, "Skipping post-rebirth recovery: current state is $state")
+            return
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val cdm = getSystemService(Context.COMPANION_DEVICE_SERVICE) as CompanionDeviceManager
             val associations = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -130,12 +139,13 @@ class MainActivity : ComponentActivity() {
             val savedMac = getSharedPreferences("open_oura_prefs", Context.MODE_PRIVATE)
                 .getString("ring_mac", null)
 
-            // If we have an OS-level association that isn't fully set up in our VM yet
+            // If we have an OS-level association, ensure the connection flow is triggered
             associations.filterNotNull().firstOrNull()?.let { mac ->
-                if (mac != savedMac) {
-                    Log.i(TAG, "Recovered association post-rebirth: $mac")
-                    viewModel.onCompanionAssociated(mac)
-                }
+                // If we are Idle or Scanning, and we have an association, trigger the link.
+                // We don't check for 'mac != savedMac' here because we want to recover 
+                // the session even if the MAC was already stored before the rebirth.
+                Log.i(TAG, "Recovering association post-rebirth: $mac")
+                viewModel.onCompanionAssociated(mac)
             }
         }
     }

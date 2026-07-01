@@ -87,15 +87,25 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private var pendingPairing: Pair<String, ByteArray>? = null
 
+    private var pairingAttemptCount = 0
+
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, binder: IBinder) {
             val ouraBinder = binder as OuraBleService.OuraBinder
-            service = ouraBinder.getService()
+            val boundService = ouraBinder.getService()
+            service = boundService
             isBound = true
 
             // Attach listeners to service flows
             viewModelScope.launch {
-                OuraBleService.connectionState.collect { _connectionState.value = it }
+                OuraBleService.connectionState.collect { state ->
+                    _connectionState.value = state
+                    if (state == ConnectionState.Ready) {
+                        pairingAttemptCount = 0
+                    } else if (state is ConnectionState.Failed) {
+                        pairingAttemptCount++
+                    }
+                }
             }
             viewModelScope.launch {
                 OuraBleService.deviceMetadata.collect { _deviceMetadata.value = it }
@@ -110,7 +120,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             // CRITICAL: Prioritize volatile pending pair states over passive auto-reconnections
             pendingPairing?.let { (mac, key) ->
                 Log.i("MainScreenViewModel", "Executing recovered pending pairing for $mac")
-                service?.pairNewRing(mac, key)
+                boundService.pairNewRing(mac, key)
                 pendingPairing = null
             } ?: run {
                 // Otherwise auto-reconnect if ring address and key are already paired
@@ -254,6 +264,12 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      * Generates a key, registers for range/presence events, and runs initial pairing.
      */
     fun onCompanionAssociated(macAddress: String) {
+        // If we've already tried too many times, abort auto-retry to prevent loops
+        if (pairingAttemptCount >= 3) {
+            Log.w("MainScreenViewModel", "Max pairing retries reached. Standing down.")
+            _connectionState.value = ConnectionState.Failed("Maximum connection retries exceeded.")
+            return
+        }
         setScanning(false)
         val sanitizedMac = macAddress.uppercase()
 
@@ -346,6 +362,19 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         securePrefs.edit().remove("ring_key").apply()
         OuraBleService.updateConnectionState(ConnectionState.Idle, "User cleared device")
         _deviceMetadata.value = OuraDeviceMetadata()
+    }
+
+    /**
+     * Public trigger to connect to the saved device using existing credentials.
+     */
+    fun connectAndSync() {
+        val mac = sharedPrefs.getString("ring_mac", null)
+        val keyHex = securePrefs.getString("ring_key", null)
+        if (mac != null && keyHex != null) {
+            connectDevice(mac, keyHex)
+        } else {
+            OuraBleService.updateConnectionState(ConnectionState.Failed("No saved device found."), "Manual Connect Trigger")
+        }
     }
 
     private fun autoReconnectIfPossible() {

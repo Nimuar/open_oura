@@ -50,11 +50,11 @@ data class Packet(
 
 object Req {
     val firmware = byteArrayOf(0x08, 0x03, 0x00, 0x00, 0x00)
-    val battery = packet(0x0c, byteArrayOf())
+    val battery = packet(0x0c.toByte(), byteArrayOf())
     val authNonce = byteArrayOf(0x2f, 0x01, 0x2b)
     val serial = byteArrayOf(0x18, 0x03, 0x08, 0x00, 0x10)
     val hardware = byteArrayOf(0x18, 0x03, 0x18, 0x00, 0x10)
-    val realtimeOff = packet(0x06, byteArrayOf(0, 0, 0, 0))
+    val realtimeOff = packet(0x06.toByte(), byteArrayOf(0, 0, 0, 0))
     val factoryReset = byteArrayOf(0x1a, 0x00)
 
     fun packet(tag: Byte, payload: ByteArray): ByteArray {

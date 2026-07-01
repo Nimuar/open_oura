@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import com.example.openoura.ble.ConnectionState
+import com.example.openoura.ble.OuraBleService
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 
@@ -34,6 +36,13 @@ class OuraCompanionService : CompanionDeviceService() {
         val savedMac = sharedPrefs.getString("ring_mac", null)
 
         if (savedMac != null && savedMac.equals(deviceAddress, ignoreCase = true)) {
+            // Check if the service is already busy with a connection (e.g. from the UI)
+            val currentState = OuraBleService.connectionState.value
+            if (currentState != ConnectionState.Idle && currentState !is ConnectionState.Failed) {
+                Log.d(TAG, "Skipping background sync trigger: Service is already busy ($currentState)")
+                return
+            }
+
             try {
                 val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
                 val securePrefs = EncryptedSharedPreferences.create(

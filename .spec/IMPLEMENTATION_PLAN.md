@@ -21,7 +21,14 @@ This plan describes the architectural changes to harden the `open_oura` Android 
     *   We will implement `OuraCompanionService` extending `CompanionDeviceService`. The OS automatically wakes this service in the background whenever the associated ring is nearby.
     *   Upon wakeup, `OuraCompanionService` will start `OuraBleService` to perform a short, targeted sync loop, then shut down gracefully to consume zero idle memory/battery.
 
-### 3. Observability: Rust-Native Diagnostic Ring Buffer
+### 4. Concurrency Hardening & Connection collision Gating
+*   **The Problem:** Overlapping connection requests (caused by background Companion wakeups triggering at the same time as UI binds) trigger duplicate `connectGatt` sessions, causing the ring to reject the cryptographic handshake and drop the connection.
+*   **The Fix:**
+    *   Add state checks in `OuraBleService` to abort `connectToDevice` and `pairNewRing` if a connection is currently active.
+    *   Add safety checks in `OuraCompanionService` to skip starting the background service if it is already connecting or active.
+    *   Print audit logs containing normalized uppercase MAC addresses and the first 4 bytes of cryptographic keys upon connection startup to allow storage validation.
+
+### 5. Observability: Rust-Native Diagnostic Ring Buffer
 *   **The Problem:** Troubleshooting decryption failures, AES handshakes, and packet reassembly issues from Kotlin standard outputs is difficult due to system log truncation.
 *   **The Fix:** We will add a diagnostic logging buffer directly to our `oura-ffi` crate wrapper.
     *   Define a thread-safe, memory-bounded static queue (`Mutex<VecDeque<String>>`) in `crates/oura-ffi/src/lib.rs`.

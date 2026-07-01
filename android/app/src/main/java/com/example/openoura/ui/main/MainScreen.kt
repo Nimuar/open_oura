@@ -301,8 +301,30 @@ fun MainScreen(
                 Text("Disconnect")
             }
         } else {
+            val savedMac = viewModel.getSavedMacAddress()
+            val hasCredentials = savedMac != null && viewModel.getSavedKeyHex() != null
+
+            if (hasCredentials) {
+                // Persistent Connection Button - Reuse existing key
+                Button(
+                    onClick = { viewModel.connectAndSync() },
+                    modifier = Modifier.fillMaxWidth().height(50.dp).padding(bottom = 8.dp)
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Connect")
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Connect to Ring")
+                }
+
+                Text(
+                    text = "Saved Ring: $savedMac",
+                    fontSize = 12.sp,
+                    color = Color.Gray,
+                    modifier = Modifier.padding(bottom = 16.dp)
+                )
+            }
+
             // Companion Device Setup - System Picker (Recommended)
-            Button(
+            OutlinedButton(
                 onClick = {
                     val activity = context as? MainActivity
                     activity?.triggerCompanionDeviceAssociation()
@@ -311,7 +333,7 @@ fun MainScreen(
             ) {
                 Icon(Icons.Default.Build, contentDescription = "Companion Setup")
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Companion Setup (Recommended)")
+                Text(if (hasCredentials) "Repair / Change Ring" else "Companion Setup (Recommended)")
             }
 
             // Legacy manual scan
