@@ -188,8 +188,13 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         _isScanning.value = active
         if (active) {
             OuraBleService.updateConnectionState(ConnectionState.Scanning, "User started scanning")
-        } else if (OuraBleService.connectionState.value == ConnectionState.Scanning) {
-            OuraBleService.updateConnectionState(ConnectionState.Idle, "Scanning stopped/cancelled")
+        } else {
+            // When stopping, only revert to Idle if we were actually scanning.
+            // This prevents overwriting 'Connecting' or 'Ready' states during rebirth recovery.
+            val currentState = OuraBleService.connectionState.value
+            if (currentState == ConnectionState.Scanning) {
+                OuraBleService.updateConnectionState(ConnectionState.Idle, "Scanning stopped/cancelled")
+            }
         }
     }
 
@@ -220,6 +225,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     fun connectDevice(macAddress: String, keyHex: String) {
         stopScan()
         try {
+            val sanitizedMac = macAddress.trim().uppercase()
             val keyBytes = hexStringToByteArray(keyHex.trim())
             if (keyBytes.size != 16) {
                 OuraBleService.updateConnectionState(ConnectionState.Failed("Key must be 16 bytes (32 hex characters)"), "Invalid manual key length")
@@ -227,10 +233,10 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             }
 
             // Save credentials
-            sharedPrefs.edit().putString("ring_mac", macAddress).apply()
+            sharedPrefs.edit().putString("ring_mac", sanitizedMac).apply()
             securePrefs.edit().putString("ring_key", keyHex).apply()
 
-            service?.connectToDevice(macAddress, keyBytes)
+            service?.connectToDevice(sanitizedMac, keyBytes)
         } catch (e: Exception) {
             OuraBleService.updateConnectionState(ConnectionState.Failed("Invalid key format: ${e.message}"), "Hex parsing error")
         }
@@ -242,20 +248,21 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      */
     fun onCompanionAssociated(macAddress: String) {
         setScanning(false)
+        val sanitizedMac = macAddress.uppercase()
         val keyBytes = ByteArray(16)
         SecureRandom().nextBytes(keyBytes)
         val keyHex = byteArrayToHexString(keyBytes)
 
         // Save credentials
-        sharedPrefs.edit().putString("ring_mac", macAddress).apply()
+        sharedPrefs.edit().putString("ring_mac", sanitizedMac).apply()
         securePrefs.edit().putString("ring_key", keyHex).apply()
 
-        // Start observing presence
+        // Start observing presence at the OS level
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val cdm = context.getSystemService(Context.COMPANION_DEVICE_SERVICE) as CompanionDeviceManager
             try {
-                cdm.startObservingDevicePresence(macAddress)
-                Log.d("MainScreenViewModel", "Presence observation started for: $macAddress")
+                cdm.startObservingDevicePresence(sanitizedMac)
+                Log.d("MainScreenViewModel", "Presence observation started for: $sanitizedMac")
             } catch (e: Exception) {
                 Log.e("MainScreenViewModel", "Failed to start presence observation: ${e.message}")
             }
@@ -263,10 +270,10 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
         // Perform initial pairing handshake
         if (service != null) {
-            service?.pairNewRing(macAddress, keyBytes)
+            Log.i("MainScreenViewModel", "Service alive, entering initial pairing handshake.")
+            service?.pairNewRing(sanitizedMac, keyBytes)
         } else {
-            Log.i("MainScreenViewModel", "Service not bound. Queuing pairing for $macAddress")
-            pendingPairing = Pair(macAddress, keyBytes)
+            Log.i("MainScreenViewModel", "Service not bound yet. Initializing background link.")
             initializeService()
         }
     }
@@ -276,15 +283,16 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      */
     fun pairNewDevice(macAddress: String) {
         stopScan()
+        val sanitizedMac = macAddress.uppercase()
         val keyBytes = ByteArray(16)
         SecureRandom().nextBytes(keyBytes)
         val keyHex = byteArrayToHexString(keyBytes)
 
         // Save credentials
-        sharedPrefs.edit().putString("ring_mac", macAddress).apply()
+        sharedPrefs.edit().putString("ring_mac", sanitizedMac).apply()
         securePrefs.edit().putString("ring_key", keyHex).apply()
 
-        service?.pairNewRing(macAddress, keyBytes)
+        service?.pairNewRing(sanitizedMac, keyBytes)
     }
 
     fun triggerSync() {
@@ -329,8 +337,15 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         val mac = sharedPrefs.getString("ring_mac", null)
         val keyHex = securePrefs.getString("ring_key", null)
         if (mac != null && keyHex != null) {
+            val sanitizedMac = mac.uppercase()
             val keyBytes = hexStringToByteArray(keyHex)
-            service?.connectToDevice(mac, keyBytes)
+
+            // If our application state indicates we dropped mid-pairing or just associated,
+            // run pairNewRing instead of connectToDevice to force a 0x25 token write.
+            if (OuraBleService.connectionState.value == ConnectionState.Idle) {
+                Log.i("MainScreenViewModel", "Auto-recovering link state for device: $sanitizedMac")
+                service?.connectToDevice(sanitizedMac, keyBytes)
+            }
         }
     }
 

@@ -68,18 +68,25 @@ class MainActivity : ComponentActivity() {
                 intentData.getParcelableExtra("android.companion.extra.ASSOCIATION_INFO")
             }
 
-            val mac = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                associationInfo?.deviceMacAddress?.toString()
-            } else {
-                @Suppress("DEPRECATION")
-                associationInfo?.deviceMacAddress?.toString()
-            }
+            val mac = associationInfo?.deviceMacAddress?.toString()
 
             if (mac != null) {
-                Log.d(TAG, "Companion associated successfully: $mac")
-                viewModel.onCompanionAssociated(mac)
+                Log.d(TAG, "Companion associated successfully post-rebirth: $mac")
+
+                // CRITICAL: Ensure permissions are validated before updating the VM or trigger connection
+                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                    viewModel.onCompanionAssociated(mac)
+                } else {
+                    // Cache the mac explicitly in preferences so it survives if we must re-request permissions
+                    getSharedPreferences("open_oura_prefs", Context.MODE_PRIVATE)
+                        .edit().putString("ring_mac", mac).apply()
+                    checkAndRequestPermissions()
+                }
                 Toast.makeText(this, "Associated ring: $mac", Toast.LENGTH_SHORT).show()
             }
+        } else {
+            Log.e(TAG, "Companion picker overlay returned non-OK result code: ${result.resultCode}")
+            viewModel.setScanning(false)
         }
     }
 
@@ -100,6 +107,33 @@ class MainActivity : ComponentActivity() {
         }
 
         checkAndRequestPermissions()
+        recoverPostRebirthAssociation()
+    }
+
+    /**
+     * Checks if a new association was created while the process was dead.
+     */
+    private fun recoverPostRebirthAssociation() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val cdm = getSystemService(Context.COMPANION_DEVICE_SERVICE) as CompanionDeviceManager
+            val associations = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                cdm.myAssociations.map { it.deviceMacAddress?.toString() }
+            } else {
+                @Suppress("DEPRECATION")
+                cdm.associations
+            }
+
+            val savedMac = getSharedPreferences("open_oura_prefs", Context.MODE_PRIVATE)
+                .getString("ring_mac", null)
+
+            // If we have an OS-level association that isn't fully set up in our VM yet
+            associations.filterNotNull().firstOrNull()?.let { mac ->
+                if (mac != savedMac) {
+                    Log.i(TAG, "Recovered association post-rebirth: $mac")
+                    viewModel.onCompanionAssociated(mac)
+                }
+            }
+        }
     }
 
     private fun checkAndRequestPermissions() {
