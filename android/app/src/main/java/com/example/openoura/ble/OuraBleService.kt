@@ -210,7 +210,15 @@ class OuraBleService : Service() {
 
         updateConnectionState(ConnectionState.Connecting, "Manual connection started for $macAddress")
         updateNotification("Connecting to Oura Ring...")
-        bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            bluetoothGatt = device.connectGatt(
+                applicationContext,
+                false,
+                gattCallback,
+                BluetoothDevice.TRANSPORT_LE
+            )
+        }
     }
 
     /**
@@ -228,7 +236,15 @@ class OuraBleService : Service() {
 
         updateConnectionState(ConnectionState.Connecting, "Pairing sequence started for $macAddress")
         updateNotification("Pairing with Oura Ring...")
-        bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            bluetoothGatt = device.connectGatt(
+                applicationContext,
+                false,
+                gattCallback,
+                BluetoothDevice.TRANSPORT_LE
+            )
+        }
     }
 
     fun disconnect() {
