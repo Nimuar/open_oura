@@ -34,6 +34,7 @@ import com.example.openoura.ble.ConnectionState
 import com.example.openoura.health.HealthConnectManager
 import com.example.openoura.MainActivity
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -50,6 +51,7 @@ fun MainScreen(
     val metadata by viewModel.deviceMetadata.collectAsStateWithLifecycle()
     val syncProgress by viewModel.syncProgress.collectAsStateWithLifecycle()
     val diagnosticLogs by viewModel.diagnosticLogs.collectAsStateWithLifecycle()
+    val eventHistory by viewModel.decodedEventHistory.collectAsStateWithLifecycle()
 
     // Scan flows
     val isScanning by viewModel.isScanning.collectAsStateWithLifecycle()
@@ -228,6 +230,39 @@ fun MainScreen(
                             text = "Battery: $it% ${if (metadata.isCharging) "(Charging)" else ""}",
                             fontSize = 14.sp
                         )
+                    }
+                }
+            }
+        }
+
+        // Event History Card
+        if (eventHistory.isNotEmpty()) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
+                    Text(
+                        text = "Synced Event History (${eventHistory.size} total)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+
+                    // Show the last 3 events
+                    eventHistory.takeLast(3).reversed().forEach { eventStr ->
+                        try {
+                            val json = JSONObject(eventStr)
+                            val name = json.optString("name", "Unknown")
+                            val tag = json.optInt("tag")
+                            val ts = json.optLong("timestamp")
+                            Text(
+                                text = "• $name (Tag: 0x${Integer.toHexString(tag)}, TS: $ts)",
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                        } catch (e: Exception) {
+                            Text(text = "• Raw event (malformed)", fontSize = 13.sp)
+                        }
                     }
                 }
             }

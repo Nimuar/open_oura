@@ -88,6 +88,9 @@ class OuraBleService : Service() {
 
         private val _syncProgress = MutableStateFlow<String?>(null)
         val syncProgress: StateFlow<String?> = _syncProgress
+
+        private val _decodedEventHistory = MutableStateFlow<List<String>>(emptyList())
+        val decodedEventHistory: StateFlow<List<String>> = _decodedEventHistory
     }
 
     private val binder = OuraBinder()
@@ -133,11 +136,31 @@ class OuraBleService : Service() {
         
         Log.d(TAG, "Service Created. Initial state: ${connectionState.value}")
 
+        // Load initial history from disk
+        loadEventHistory()
+
         // Start the sequential packet processing daemon
         serviceScope.launch {
             for (data in inboundPacketChannel) {
                 processRawPacket(data)
             }
+        }
+    }
+
+    private fun loadEventHistory() {
+        try {
+            val file = File(filesDir, "oura_history.json")
+            if (file.exists()) {
+                val content = file.readText()
+                val jsonArray = JSONArray(content)
+                val list = mutableListOf<String>()
+                for (i in 0 until jsonArray.length()) {
+                    list.add(jsonArray.getString(i))
+                }
+                _decodedEventHistory.value = list
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load event history: ${e.message}")
         }
     }
 
@@ -399,6 +422,15 @@ class OuraBleService : Service() {
 
             // Read device info
             readDeviceInfo()
+
+            // F-4.5: Live HR flow setup
+            try {
+                writeRaw(Req.setNotification(0x3f.toByte()))
+                writeRaw(Req.setFeatureMode(OuraGATT.FEATURE_DAYTIME_HR, OuraGATT.FEATURE_MODE_CONNECTED_LIVE))
+                Log.d(TAG, "Sent Live HR activation packets (setNotification(0x3f) and setFeatureMode(DAYTIME_HR, CONNECTED_LIVE))")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send Live HR activation packets: ${e.message}", e)
+            }
         } else {
             updateConnectionState(ConnectionState.Failed("Wrong authentication key"), "Ring rejected encrypted nonce")
         }
@@ -496,6 +528,9 @@ class OuraBleService : Service() {
         // Save new events to oura_history.json
         if (newEvents.isNotEmpty()) {
             saveEventsToFile(newEvents)
+            // Update in-memory event history flow
+            _decodedEventHistory.value = _decodedEventHistory.value + newEvents
+
             // Save updated cursor
             sharedPrefs.edit().putInt("sync_cursor", cursor).apply()
 

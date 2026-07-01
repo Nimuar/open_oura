@@ -65,6 +65,10 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     private val _syncProgress = MutableStateFlow<String?>(null)
     val syncProgress: StateFlow<String?> = _syncProgress.asStateFlow()
 
+    // Decoded event history flow
+    private val _decodedEventHistory = MutableStateFlow<List<String>>(emptyList())
+    val decodedEventHistory: StateFlow<List<String>> = _decodedEventHistory.asStateFlow()
+
     // Diagnostics logs flow
     private val _diagnosticLogs = MutableStateFlow<List<String>>(emptyList())
     val diagnosticLogs: StateFlow<List<String>> = _diagnosticLogs.asStateFlow()
@@ -98,6 +102,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             }
             viewModelScope.launch {
                 OuraBleService.syncProgress.collect { _syncProgress.value = it }
+            }
+            viewModelScope.launch {
+                OuraBleService.decodedEventHistory.collect { _decodedEventHistory.value = it }
             }
 
             // CRITICAL: Prioritize volatile pending pair states over passive auto-reconnections
