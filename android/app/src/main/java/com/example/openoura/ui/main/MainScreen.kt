@@ -250,19 +250,21 @@ fun MainScreen(
 
                     // Show the last 3 events
                     eventHistory.takeLast(3).reversed().forEach { eventStr ->
+                        var displayStr = "• Raw event (malformed)"
                         try {
                             val json = JSONObject(eventStr)
                             val name = json.optString("name", "Unknown")
                             val tag = json.optInt("tag")
                             val ts = json.optLong("timestamp")
-                            Text(
-                                text = "• $name (Tag: 0x${Integer.toHexString(tag)}, TS: $ts)",
-                                fontSize = 13.sp,
-                                modifier = Modifier.padding(bottom = 4.dp)
-                            )
+                            displayStr = "• $name (Tag: 0x${Integer.toHexString(tag)}, TS: $ts)"
                         } catch (e: Exception) {
-                            Text(text = "• Raw event (malformed)", fontSize = 13.sp)
+                            // Keep default malformed text
                         }
+                        Text(
+                            text = displayStr,
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(bottom = 4.dp)
+                        )
                     }
                 }
             }
