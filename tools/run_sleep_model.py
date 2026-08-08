@@ -9,15 +9,15 @@ device-relative deciseconds anchored to the latest event's captured_unix.
 Usage: python tools/run_sleep_model.py START_DS END_DS [DB] [TZ=1]
        (no args → uses the bedtime_period in the DB)
 """
-import sys, json, sqlite3, datetime
-from pathlib import Path
+import json
+import sys
+
 import torch
 
-from _common import resolve_db
+from _common import DsClock, connect, decoded_events, ibi_valid, latest_bedtime, local_dt, resolve_db
+from _models import f32, i64, load_model
 
-REPO = Path(__file__).resolve().parent.parent
 TZ = 1
-MODEL = str(REPO / "notes" / "models" / "sleepnet_moonstone_1_2_0.pt")
 STAGE = {1: "DEEP", 2: "LIGHT", 3: "REM", 4: "WAKE"}
 
 args = [a for a in sys.argv[1:]]
@@ -30,20 +30,15 @@ else:
 db_arg = rest[0] if rest else None
 if len(rest) > 1:
     TZ = int(rest[1])
-DB = resolve_db(db_arg, REPO)
+DB = resolve_db(db_arg)
 
-con = sqlite3.connect(str(DB))
-rows = con.execute("SELECT ring_timestamp, tag, decoded_json, captured_unix FROM events "
-                   "WHERE decoded_json IS NOT NULL ORDER BY ring_timestamp").fetchall()
-max_ds, anchor_unix = max(((r[0], r[3]) for r in rows), key=lambda x: x[0])
-def ms(ds):  # device deciseconds -> absolute epoch ms (int64), consistent across signals
-    return int(anchor_unix * 1000 - (max_ds - ds) * 100)
+con = connect(DB)
+rows = decoded_events(con, key="tag")
+clock = DsClock(rows)
+ms = clock.ms  # device deciseconds -> absolute epoch ms (int64), shared by every signal
 
-if start_ds is None:  # default: most recent bedtime_period in the DB (matches run_models.last_bedtime)
-    bt = con.execute("SELECT decoded_json FROM events WHERE tag=118 ORDER BY ring_timestamp DESC").fetchone()
-    if bt is None:
-        raise SystemExit("no bedtime_period (tag 0x76) in DB — pass start/end deciseconds or sync overnight data first")
-    v = json.loads(bt[0])
+if start_ds is None:  # default: most recent bedtime_period in the DB
+    v = latest_bedtime(con, hint="pass start/end deciseconds or sync overnight data first")
     start_ds, end_ds = v["bedtime_start_ds"], v["bedtime_end_ds"]
 
 lo, hi = start_ds - 6000, end_ds + 6000  # ±10 min margin
@@ -59,7 +54,7 @@ for ds, tag, js, _ in rows:
             if x <= 0:  # zero/negative IBI can't advance the beat clock — skip (matches run_bdi)
                 continue
             acc += x
-            valid = 1 if 300 <= x <= 2000 else 0
+            valid = 1 if ibi_valid(x) else 0
             beats.append((t + acc, float(x), float(amp[i] if i < len(amp) else 0), valid))
     elif tag == 0x47 and v.get("motion_seconds") is not None:
         acm.append((ms(ds), float(v["motion_seconds"])))
@@ -74,19 +69,19 @@ if not beats or not any(b[3] == 1 for b in beats):
 
 def col(seq, i):
     return [r[i] for r in seq]
-ibi_ts = torch.tensor(col(beats, 0), dtype=torch.int64)
-ibi_val = torch.tensor([[b[1], b[2], b[3]] for b in beats], dtype=torch.float32)
-acm_ts = torch.tensor(col(acm, 0), dtype=torch.int64)
-acm_val = torch.tensor([[a[1]] for a in acm], dtype=torch.float32)
-temp_ts = torch.tensor(col(temp, 0), dtype=torch.int64)
-temp_val = torch.tensor([[t[1]] for t in temp], dtype=torch.float32)
-bedtime = torch.tensor([ms(start_ds), ms(end_ds)], dtype=torch.int64)
+ibi_ts = i64(col(beats, 0))
+ibi_val = f32([[b[1], b[2], b[3]] for b in beats], cols=3)
+acm_ts = i64(col(acm, 0))
+acm_val = f32([[a[1]] for a in acm], cols=1)
+temp_ts = i64(col(temp, 0))
+temp_val = f32([[t[1]] for t in temp], cols=1)
+bedtime = i64([ms(start_ds), ms(end_ds)])
 spo2_val = torch.empty(0, 1, dtype=torch.float32)
 spo2_ts = torch.empty(0, dtype=torch.int64)
-scalars = torch.tensor([35, 25, 0, 0, 0], dtype=torch.float32)
-tst = torch.tensor([300.0], dtype=torch.float32)
+scalars = f32([35, 25, 0, 0, 0])
+tst = f32([300.0])
 
-m = torch.jit.load(MODEL, map_location="cpu").eval()
+m = load_model("sleepnet_moonstone_1_2_0")
 with torch.no_grad():
     ts, staging, apnea, spo2_out, metrics, debug = m(
         bedtime, ibi_val, ibi_ts, acm_val, acm_ts, temp_val, temp_ts,
@@ -107,7 +102,7 @@ print(f"  asleep {asleep:.0f} min,  sleep efficiency {100*asleep/(n*0.5):.0f}%")
 # compact timeline: one glyph per ~10 min (20 epochs), majority stage
 g = {1: "D", 2: "L", 3: "R", 4: "W"}
 def hm(ms_):
-    return datetime.datetime.utcfromtimestamp(ms_/1000 + TZ*3600).strftime("%H:%M")
+    return local_dt(ms_ / 1000, TZ).strftime("%H:%M")
 print(f"\n  {hm(int(ts[0]))} ", end="")
 for i in range(0, n, 20):
     blk = stages[i:i+20]

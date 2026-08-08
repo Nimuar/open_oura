@@ -21,23 +21,21 @@ NaN. Detecting *when* an activity happens (and workout-vs-not) is reliable; the
 exact sport label is the model's best guess from MET/motion/HR/temp alone.
 """
 import argparse
-import datetime
 import json as jsonlib
-import sqlite3
+import os
 import sys
-from pathlib import Path
-
 import warnings
+from pathlib import Path
 
 import torch
 
-from _common import resolve_db
+from _common import DsClock, connect, decoded_events, local_dt, resolve_db
+from _models import f32, load_model
 
 # The model triggers a benign non-contiguous torch.searchsorted perf warning.
 warnings.filterwarnings("ignore", message=".*searchsorted.*")
 
-REPO = Path(__file__).resolve().parent.parent
-MODEL = REPO / "notes" / "models" / "automatic_activity_detection_3_1_11.pt"
+MODEL_NAME = "automatic_activity_detection_3_1_11"
 MODEL_VERSION = "3.1.11"
 
 # behavior-id -> name, from the model's behavior table (ActivityTypes.json).
@@ -85,35 +83,25 @@ def parse_args():
 
 def main():
     args = parse_args()
-    db = resolve_db(args.db, REPO)
-    if not MODEL.exists():
-        sys.exit(f"error: model not found: {MODEL}")
+    db = resolve_db(args.db)
 
-    con = sqlite3.connect(str(db))
-    rows = con.execute(
-        "SELECT ring_timestamp, tag, decoded_json, captured_unix FROM events "
-        "WHERE decoded_json IS NOT NULL ORDER BY ring_timestamp"
-    ).fetchall()
+    con = connect(db)
+    rows = decoded_events(con, key="tag")
     if not rows:
         sys.exit(f"error: no decoded events in {db} (run `oura sync` first)")
 
-    # Anchor ring deciseconds to wall-clock via the latest event's capture time.
-    max_ds, anchor_unix = max(((r[0], r[3]) for r in rows), key=lambda x: x[0])
+    clock = DsClock(rows)
     min_ds = min(r[0] for r in rows)
-
-    def _unix_min(ds):
-        return (anchor_unix - (max_ds - ds) / 10.0) / 60.0
 
     # Rebase by whole days: keeps time-of-day (model uses min%1440) but keeps
     # values small enough to be EXACT in float32 (unix-minutes ~29.7M exceed
     # 2^24 integer precision and silently break the model's time alignment).
-    OFFSET = int(_unix_min(min_ds) // 1440) * 1440
+    OFFSET = int(clock.minutes(min_ds) // 1440) * 1440
 
     def tmin(ds):
-        return int(round(_unix_min(ds))) - OFFSET
+        return int(round(clock.minutes(ds))) - OFFSET
 
     met, motion, temp, hr = [], [], [], []
-    import os
     acm_scale = float(os.environ.get("ACM_SCALE", "1"))
     for ds, tag, js, _ in rows:
         try:
@@ -141,13 +129,8 @@ def main():
     if not met:
         sys.exit("no MET (activity_information / tag 0x50) events in DB — cannot run the activity model")
 
-    def f32(seq, cols):
-        # keep rank 2 ([0, cols]) for empty series, matching the LibTorch mat() path;
-        # a bare torch.tensor([]) is 1-D and shape-mismatches the model.
-        if seq:
-            return torch.tensor(seq, dtype=torch.float32)
-        return torch.empty((0, cols), dtype=torch.float32)
-
+    # f32(..., cols) keeps rank 2 ([0, cols]) for empty series, matching the
+    # LibTorch mat() path; a 1-D tensor shape-mismatches the model.
     met_t, motion_t = f32(met, 2), f32(sorted(motion), 9)
     temp_t, hr_t = f32(sorted(temp), 2), f32(sorted(hr), 2)
     # stepmotion stub: NaN features spanning the FULL range, else its last
@@ -162,18 +145,18 @@ def main():
             r = f"{len(t)} rows  [{int(t[0,0])}..{int(t[-1,0])}] min" if len(t) else "EMPTY"
             print(f"  {n}: {r}", file=sys.stderr)
 
-    d = datetime.datetime.utcfromtimestamp(anchor_unix + args.tz * 3600)
-    context = torch.tensor([d.year, d.month, d.day, d.weekday()], dtype=torch.float32)
-    user = torch.tensor([30, 1, 1.78, 78] + [float("nan")] * 10, dtype=torch.float32)
+    d = local_dt(clock.anchor_unix, args.tz)
+    context = f32([d.year, d.month, d.day, d.weekday()])
+    user = f32([30, 1, 1.78, 78] + [float("nan")] * 10)
 
-    m = torch.jit.load(str(MODEL), map_location="cpu").eval()
+    m = load_model(MODEL_NAME)
     with torch.no_grad():
         workouts, _, _segments = m(
             context, user, met_t, step_t, motion_t, temp_t, hr_t,
             None, None, torch.tensor(args.threshold), torch.tensor(args.min_duration), torch.tensor(0.0))
 
     def to_local(minute):
-        return datetime.datetime.utcfromtimestamp((minute + OFFSET) * 60 + args.tz * 3600)
+        return local_dt((minute + OFFSET) * 60, args.tz)
 
     # workouts[n,9] = [start_min, end_min, is_workout_prob, id1,p1, id2,p2, id3,p3]
     sessions = []

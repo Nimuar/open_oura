@@ -8,12 +8,10 @@ Models live in notes/models/ (gitignored).
 """
 import json
 import sys
-from pathlib import Path
 
 import torch
 
-REPO = Path(__file__).resolve().parent.parent
-MODELS_DIR = REPO / "notes" / "models"
+from _models import model_path
 
 # newest version per family (drop superseded duplicates)
 NEWEST = [
@@ -47,7 +45,7 @@ NEWEST = [
 
 
 def describe(name):
-    path = MODELS_DIR / f"{name}.pt"
+    path = model_path(name)
     info = {"model": name, "loaded": False}
     if not path.exists():
         info["error"] = "file missing"

@@ -23,23 +23,21 @@ Usage: python tools/run_cva_model.py [DB] [--sex M|F|O] [--age Y] [--height M]
                                       [--weight KG] [--ring N] [--since-cursor DS]
 """
 import argparse
-import sqlite3
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
 
-from _common import resolve_db
+from _common import connect, resolve_db
+from _models import f32, load_model
 
-REPO = Path(__file__).resolve().parent.parent
-MODEL = REPO / "notes" / "models" / "cva_2_1_0.pt"
+MODEL_NAME = "cva_2_1_0"
 SEG_LEN = 1500          # samples per segment (hard model constant)
 GAP_DS = 20             # >2 s (deciseconds) splits two PPG measurements
 
 
 def build_segments(db, since_ds):
-    con = sqlite3.connect(str(db))
+    con = connect(db)
     rows = con.execute(
         "SELECT ring_timestamp, body FROM events WHERE tag=129 AND ring_timestamp>? "
         "ORDER BY ring_timestamp",
@@ -76,17 +74,15 @@ def main():
     p.add_argument("--ring", type=float, default=10.0, help="ring size")
     p.add_argument("--since-cursor", type=int, default=0, help="only events with ring_timestamp > this")
     args = p.parse_args()
-    if not MODEL.exists():
-        sys.exit(f"model not found: {MODEL}")
 
-    segs, n_runs = build_segments(resolve_db(args.db, REPO), args.since_cursor)
+    segs, n_runs = build_segments(resolve_db(args.db), args.since_cursor)
     if not segs:
         sys.exit(f"no full {SEG_LEN}-sample PPG segment available ({n_runs} measurement runs, all too short)")
-    ppg = torch.tensor(np.stack(segs), dtype=torch.float32)
+    ppg = f32(np.stack(segs))
     sex = {"F": -1.0, "M": 1.0, "O": 0.0}[args.sex]
-    demo = torch.tensor([[sex, args.height, args.age, args.ring, args.weight]], dtype=torch.float32)
+    demo = f32([[sex, args.height, args.age, args.ring, args.weight]])
 
-    m = torch.jit.load(str(MODEL), map_location="cpu").eval()
+    m = load_model(MODEL_NAME)
     with torch.no_grad():
         cva, quality, raw_quality, pwv, seg_metrics = m(ppg, demo)
 

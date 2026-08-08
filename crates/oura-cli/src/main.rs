@@ -215,6 +215,14 @@ fn save_key(path: &Path, key: &[u8; 16]) -> Result<()> {
     Ok(())
 }
 
+/// Host UTC seconds, the clock the ring validates RData timestamps against.
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
 async fn connect(cli: &Cli) -> Result<OuraClient<BleTransport>> {
     let transport = BleTransport::connect(
         &cli.name,
@@ -234,6 +242,25 @@ async fn maybe_auth(client: &OuraClient<BleTransport>, key: &Option<[u8; 16]>) -
     } else {
         Ok(false)
     }
+}
+
+/// Connect for a command that only works authenticated, naming it in the error.
+async fn connect_authed(
+    cli: &Cli,
+    key: &Option<[u8; 16]>,
+    command: &str,
+) -> Result<OuraClient<BleTransport>> {
+    let client = connect(cli).await?;
+    if !maybe_auth(&client, key).await? {
+        return Err(anyhow!("{command} requires --key-file (authentication)"));
+    }
+    Ok(client)
+}
+
+/// The ring's serial, or "unknown" when it can't be read (never fatal: the
+/// serial only labels output and DB rows).
+async fn serial_or_unknown(client: &OuraClient<BleTransport>) -> String {
+    client.serial().await.unwrap_or_else(|_| "unknown".into())
 }
 
 #[tokio::main]
@@ -313,10 +340,7 @@ async fn cmd_subscribe(
         "data" => subscription_mode::FEATURE_DATA,
         other => return Err(anyhow!("unknown mode {other}")),
     };
-    let client = connect(cli).await?;
-    if !maybe_auth(&client, key).await? {
-        return Err(anyhow!("subscription requires --key-file (authentication)"));
-    }
+    let client = connect_authed(cli, key, "subscription").await?;
     let result = client
         .set_feature_subscription(cap, m)
         .await
@@ -365,10 +389,7 @@ async fn cmd_feature_mode(cli: &Cli, key: &Option<[u8; 16]>, feature: &str, mode
         "connected_live" => feature_mode::CONNECTED_LIVE,
         other => return Err(anyhow!("unknown mode {other}")),
     };
-    let client = connect(cli).await?;
-    if !maybe_auth(&client, key).await? {
-        return Err(anyhow!("set-feature-mode requires --key-file (authentication)"));
-    }
+    let client = connect_authed(cli, key, "set-feature-mode").await?;
     match client.set_feature_mode(id, m).await {
         Ok(()) => {
             println!("SetFeatureMode({feature}=0x{id:02x}, {mode}): SUCCESS.");
@@ -381,17 +402,7 @@ async fn cmd_feature_mode(cli: &Cli, key: &Option<[u8; 16]>, feature: &str, mode
 
 /// Read the actual on-ring mode/status of the data-producing features.
 async fn cmd_feature_status(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
-    let client = connect(cli).await?;
-    if !maybe_auth(&client, key).await? {
-        return Err(anyhow!("feature-status requires --key-file (authentication)"));
-    }
-    let mode_name = |m: u8| match m {
-        0 => "OFF",
-        1 => "AUTOMATIC",
-        2 => "REQUESTED",
-        3 => "CONNECTED_LIVE",
-        _ => "?",
-    };
+    let client = connect_authed(cli, key, "feature-status").await?;
     let feats = [
         (0x02u8, "daytime_hr"), (0x03, "exercise_hr"), (0x04, "spo2"),
         (0x08, "resting_hr"), (0x0b, "real_steps"), (0x0c, "experimental"),
@@ -402,7 +413,7 @@ async fn cmd_feature_status(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
         match client.feature_status(id).await {
             Ok(s) => println!(
                 "  {name:<14} {id:>3}  {:<14} {:>6} {:>5} {:>3}",
-                mode_name(s.mode), s.status, s.state, s.subscription
+                feature_mode_name(s.mode).to_ascii_uppercase(), s.status, s.state, s.subscription
             ),
             Err(e) => println!("  {name:<14} {id:>3}  <read failed: {e}>"),
         }
@@ -546,7 +557,7 @@ async fn cmd_scan(cli: &Cli) -> Result<()> {
 
 async fn cmd_pair(cli: &Cli) -> Result<()> {
     let client = connect(cli).await?;
-    let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
+    let serial = serial_or_unknown(&client).await;
 
     // Reuse an existing key file if present; otherwise mint a fresh key.
     let (key, reused) = match &cli.key_file {
@@ -637,7 +648,7 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
         client.sync_time().await.context("syncing time")?;
     }
 
-    let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
+    let serial = serial_or_unknown(&client).await;
     let info = client.firmware().await.ok();
 
     let store = Store::open(&cli.db)?;
@@ -703,7 +714,7 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
 async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
-    let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
+    let serial = serial_or_unknown(&client).await;
     let store = Store::open(&cli.db).ok();
 
     use oura_protocol::protocol::feature;
@@ -745,7 +756,7 @@ async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
 async fn cmd_live_hr(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, raw: bool) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
-    let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
+    let serial = serial_or_unknown(&client).await;
     let store = Store::open(&cli.db).ok();
 
     println!("Streaming live heart rate for {seconds}s (Ctrl-C to stop early)...");
@@ -854,7 +865,7 @@ async fn cmd_rdata(cli: &Cli, key: &Option<[u8; 16]>, action: &str) -> Result<()
 /// still — sampling rate is fixed at 50 Hz regardless of motion.
 async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     // The ring validates configure timestamps against its own clock, so sync it
     // to host UTC first — without this, arming returns idle (status 3).
@@ -862,10 +873,7 @@ async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()>
     let (sub0, st0) = client.rdata_state().await?;
     let batt0 = client.battery().await?;
     println!("After sync_time: RData state subtag={sub0} status={st0}; battery {}%", batt0.percent);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    let now = unix_now();
 
     let (csub, cst) = client.rdata_configure(&[DataType::Acm2g50Hz], now, now).await?;
     println!("Armed ACM 2g @ 50 Hz: configure subtag={csub} status={cst}");
@@ -885,36 +893,22 @@ async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()>
         // Drain BEFORE stop — the documented lifecycle is configure -> get_page ->
         // stop -> clear, and stop may discard the buffer.
         println!("Draining pages (before stop)...");
-        let mut pages = 0u32;
-        let mut total_bytes = 0usize;
-        let mut page_len = 0usize;
-        for page in 0u16..4000 {
-            let (status, bytes) = client.rdata_get_page(page).await?;
+        let drained = rdata_drain_pages(client, |page, status, bytes| {
             if page == 0 {
-                println!("  page 0: status={status}, {} bytes, raw={}", bytes.len(), hex::encode(&bytes));
+                println!("  page 0: status={status}, {} bytes, raw={}", bytes.len(), hex::encode(bytes));
             }
-            if status == 6 || bytes.is_empty() {
-                break; // NO_DATA -> past the end of recorded data
-            }
-            page_len = page_len.max(bytes.len());
-            total_bytes += bytes.len();
-            pages += 1;
-        }
-        Ok::<_, anyhow::Error>((pages, total_bytes, page_len, batt1.percent))
+        })
+        .await?;
+        Ok::<_, anyhow::Error>((drained, batt1.percent))
     }
     .await;
 
     // Mandatory teardown.
-    if let Err(e) = client.rdata_stop().await {
-        eprintln!("warning: teardown stop failed: {e}");
-    }
-    if let Err(e) = client.rdata_clear().await {
-        eprintln!("warning: teardown clear failed: {e}");
-    }
+    rdata_teardown(client).await;
     let st1 = client.rdata_state().await.map(|(_, s)| s).unwrap_or(255);
     println!("RData state after teardown: status={st1}");
 
-    let (pages, total_bytes, page_len, batt1) = body?;
+    let (Drained { pages, total_bytes, page_len }, batt1) = body?;
     if pages == 0 {
         println!(
             "\nNo pages drained. Either nothing recorded, or `stop` discards the \
@@ -947,6 +941,45 @@ async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()>
     Ok(())
 }
 
+/// What draining the ring's RData page buffer yielded.
+struct Drained {
+    pages: u32,
+    total_bytes: usize,
+    page_len: usize,
+}
+
+/// Read pages from 0 until the ring reports NO_DATA (status 6) or an empty page,
+/// i.e. past the end of the recorded data. `on_page` sees each page as it
+/// arrives, including the terminating one.
+async fn rdata_drain_pages(
+    client: &OuraClient<BleTransport>,
+    mut on_page: impl FnMut(u16, u8, &[u8]),
+) -> Result<Drained> {
+    let mut d = Drained { pages: 0, total_bytes: 0, page_len: 0 };
+    for page in 0u16..4000 {
+        let (status, bytes) = client.rdata_get_page(page).await?;
+        on_page(page, status, &bytes);
+        if status == 6 || bytes.is_empty() {
+            break;
+        }
+        d.page_len = d.page_len.max(bytes.len());
+        d.total_bytes += bytes.len();
+        d.pages += 1;
+    }
+    Ok(d)
+}
+
+/// Best-effort `stop` + `clear`: the ring keeps recording (and draining battery)
+/// until told otherwise, so every RData path must tear down even on error.
+async fn rdata_teardown(client: &OuraClient<BleTransport>) {
+    if let Err(e) = client.rdata_stop().await {
+        eprintln!("warning: teardown stop failed: {e}");
+    }
+    if let Err(e) = client.rdata_clear().await {
+        eprintln!("warning: teardown clear failed: {e}");
+    }
+}
+
 /// RData status-code name (from the decompiled app's `RDataStatusCode`).
 fn rdata_status_name(s: u8) -> &'static str {
     match s {
@@ -964,17 +997,13 @@ fn rdata_status_name(s: u8) -> &'static str {
 /// CONFIGURE with startTime=0 — and report each status. Tears down afterward.
 async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     client.sync_time().await?;
     let clear = client.rdata_clear().await?;
     println!("RDataClear  -> status {clear} ({})", rdata_status_name(clear));
     let (ssub, sbyte) = client.rdata_state().await?;
     println!("RDataState  -> subtag {ssub}, state byte {sbyte} (0 IDLE,1 SCHED,2 REC,3 STOP,4 BUSY)");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    let now = unix_now();
     let (csub, cst) = client.rdata_configure(&[DataType::Acm2g50Hz], 0, now).await?;
     println!(
         "RDataConfigure(start=0) -> subtag {csub}, status {cst} ({})",
@@ -986,8 +1015,7 @@ async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
         println!(">>> still {} — capability gate confirmed.", rdata_status_name(cst));
     }
     // Teardown regardless.
-    let _ = client.rdata_stop().await;
-    let _ = client.rdata_clear().await;
+    rdata_teardown(client).await;
     Ok(())
 }
 
@@ -998,7 +1026,7 @@ async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
 async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use oura_protocol::protocol::{capability, feature_mode, subscription_mode};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     client.sync_time().await?;
     let caps = client.capabilities().await?;
@@ -1021,33 +1049,21 @@ async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
 
     let clear = client.rdata_clear().await?;
     println!("RDataClear -> status {clear} ({})", rdata_status_name(clear));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    let now = unix_now();
     let (_, cst) = client.rdata_configure(&[DataType::Acm2g50Hz], 0, now).await?;
     println!("RDataConfigure(start=0) -> status {cst} ({})", rdata_status_name(cst));
 
-    let mut captured = (0u32, 0usize);
     if cst == 0 {
         println!(">>> ACCEPTED! Recording 30 s...");
         tokio::time::sleep(Duration::from_secs(30)).await;
-        for page in 0u16..4000 {
-            let (status, bytes) = client.rdata_get_page(page).await?;
-            if status == 6 || bytes.is_empty() {
-                break;
-            }
-            captured.0 += 1;
-            captured.1 += bytes.len();
-        }
-        println!(">>> drained {} pages, {} bytes", captured.0, captured.1);
+        let d = rdata_drain_pages(client, |_, _, _| {}).await?;
+        println!(">>> drained {} pages, {} bytes", d.pages, d.total_bytes);
     } else {
         println!(">>> still {} — enabling did not unlock CONFIGURE.", rdata_status_name(cst));
     }
 
     // Teardown.
-    let _ = client.rdata_stop().await;
-    let _ = client.rdata_clear().await;
+    rdata_teardown(client).await;
     let _ = client
         .set_feature_subscription(capability::RAW_DATA_SAMPLER, subscription_mode::OFF)
         .await;
@@ -1059,13 +1075,10 @@ async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
 /// torn down. Pure diagnostic for the Phase-2 spike — no long recording.
 async fn rdata_sweep(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     client.sync_time().await?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    let now = unix_now();
 
     // (label, types, start, current)
     let variants: &[(&str, &[DataType], u32, u32)] = &[
@@ -1088,8 +1101,7 @@ async fn rdata_sweep(client: &OuraClient<BleTransport>) -> Result<()> {
             if engaged { "<<< STATE CHANGED" } else { "(still idle)" }
         );
         // tear down before the next attempt
-        let _ = client.rdata_stop().await;
-        let _ = client.rdata_clear().await;
+        rdata_teardown(client).await;
     }
     println!("\nIf every variant stayed idle, RDataStart needs a precondition we");
     println!("haven't replicated — next step is decompiling the app's start path.");

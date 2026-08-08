@@ -22,6 +22,42 @@ pub trait Transport: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<Vec<u8>>;
 }
 
+/// Subscribe to inbound frames, dropping any backlog so only frames arriving
+/// after this call are observed.
+pub fn subscribe_fresh<T>(transport: &T) -> broadcast::Receiver<Vec<u8>>
+where
+    T: Transport + ?Sized,
+{
+    let mut rx = transport.subscribe();
+    while rx.try_recv().is_ok() {}
+    rx
+}
+
+/// Feed every inbound frame to `on_frame` for up to `duration`. A lagged
+/// receiver skips the frames it missed rather than ending the stream; a closed
+/// channel ends it early.
+pub async fn stream_until<F>(
+    rx: &mut broadcast::Receiver<Vec<u8>>,
+    duration: Duration,
+    mut on_frame: F,
+) where
+    F: FnMut(&[u8]),
+{
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(frame)) => on_frame(&frame),
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            // Channel closed or the window elapsed.
+            _ => break,
+        }
+    }
+}
+
 /// Write `request` and collect notification frames until the link is quiet for
 /// `quiet` (i.e. no new frame arrives within that window). This matches the
 /// ring's behaviour of emitting one or more notifications per request with no
@@ -30,9 +66,8 @@ pub async fn transact<T>(transport: &T, request: &[u8], quiet: Duration) -> Resu
 where
     T: Transport + ?Sized,
 {
-    let mut rx = transport.subscribe();
-    // Drop any backlog so we only observe responses to *this* request.
-    while rx.try_recv().is_ok() {}
+    // Only observe responses to *this* request.
+    let mut rx = subscribe_fresh(transport);
 
     transport.write(request).await?;
 

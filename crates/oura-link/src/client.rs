@@ -5,9 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use oura_protocol::auth::{encrypt_nonce, AuthResult};
 use oura_protocol::device::{self, Battery, Capability, DeviceInfo};
 use crate::error::{Error, Result};
-use oura_protocol::events::{EventBatchSummary, RingEvent};
+use oura_protocol::events::{bpm_from_ibi, EventBatchSummary, RingEvent};
 use oura_protocol::protocol::{self, feature, feature_mode, Packet};
-use crate::transport::{transact, Transport};
+use crate::transport::{stream_until, subscribe_fresh, transact, Transport};
 
 /// Default quiet window for collecting responses to a request.
 pub const DEFAULT_QUIET: Duration = Duration::from_millis(1500);
@@ -113,6 +113,22 @@ impl<T: Transport> OuraClient<T> {
 
     fn find(packets: &[Packet], tag: u8) -> Option<&Packet> {
         packets.iter().find(|p| p.tag == tag)
+    }
+
+    /// `(subtag, status)` from an RData response (all RData commands answer on
+    /// tag `0x03` with that two-byte header).
+    fn rdata_result(packets: &[Packet], what: &str) -> Result<(u8, u8)> {
+        Self::find(packets, 0x03)
+            .and_then(|p| Some((*p.payload.first()?, *p.payload.get(1)?)))
+            .ok_or_else(|| Error::Protocol(format!("no RData {what} response (auth required?)")))
+    }
+
+    /// The status byte of an RData response, or 255 when the ring sent none —
+    /// teardown commands report but never fail on a missing answer.
+    fn rdata_status(packets: &[Packet]) -> u8 {
+        Self::find(packets, 0x03)
+            .and_then(|p| p.payload.get(1).copied())
+            .unwrap_or(255)
     }
 
     // --- device info -------------------------------------------------------
@@ -379,23 +395,21 @@ impl<T: Transport> OuraClient<T> {
     /// Query the RData collection state (read-only). Returns `(subtag, status)`.
     pub async fn rdata_state(&self) -> Result<(u8, u8)> {
         let packets = self.request(&protocol::req_rdata_state()).await?;
-        Self::find(&packets, 0x03)
-            .and_then(|p| Some((*p.payload.first()?, *p.payload.get(1)?)))
-            .ok_or_else(|| Error::Protocol("no RData state response (auth required?)".into()))
+        Self::rdata_result(&packets, "state")
     }
 
     /// Stop an active RData collection session (part of mandatory teardown).
     /// Returns the response status byte (255 if absent).
     pub async fn rdata_stop(&self) -> Result<u8> {
         let packets = self.request(&protocol::req_rdata_stop()).await?;
-        Ok(Self::find(&packets, 0x03).and_then(|p| p.payload.get(1).copied()).unwrap_or(255))
+        Ok(Self::rdata_status(&packets))
     }
 
     /// Clear the RData session/data from the ring's flash (part of teardown).
     /// Returns the response status byte (255 if absent).
     pub async fn rdata_clear(&self) -> Result<u8> {
         let packets = self.request(&protocol::req_rdata_clear()).await?;
-        Ok(Self::find(&packets, 0x03).and_then(|p| p.payload.get(1).copied()).unwrap_or(255))
+        Ok(Self::rdata_status(&packets))
     }
 
     /// Configure/arm an RData session for one or more signal types. **This starts
@@ -410,9 +424,7 @@ impl<T: Transport> OuraClient<T> {
         let packets = self
             .request(&protocol::req_rdata_configure(types, start_unix, current_unix))
             .await?;
-        Self::find(&packets, 0x03)
-            .and_then(|p| Some((*p.payload.first()?, *p.payload.get(1)?)))
-            .ok_or_else(|| Error::Protocol("no RData configure response".into()))
+        Self::rdata_result(&packets, "configure")
     }
 
     /// Fetch one RData page by index. Returns `(status, page_bytes)` where
@@ -441,9 +453,7 @@ impl<T: Transport> OuraClient<T> {
     where
         F: FnMut(HeartRateSample),
     {
-        let mut rx = self.transport.subscribe();
-        // Drain backlog.
-        while rx.try_recv().is_ok() {}
+        let mut rx = subscribe_fresh(&self.transport);
 
         self.transport
             .write(&protocol::req_set_feature_mode(
@@ -452,25 +462,15 @@ impl<T: Transport> OuraClient<T> {
             ))
             .await?;
 
-        let deadline = tokio::time::Instant::now() + duration;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
+        stream_until(&mut rx, duration, |frame| {
+            if debug {
+                eprintln!("raw notify: {}", hex::encode(frame));
             }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(frame)) => {
-                    if debug {
-                        eprintln!("raw notify: {}", hex::encode(&frame));
-                    }
-                    if let Some(sample) = parse_live_hr_frame(&frame) {
-                        on_sample(sample);
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                _ => break,
+            if let Some(sample) = parse_live_hr_frame(frame) {
+                on_sample(sample);
             }
-        }
+        })
+        .await;
 
         // Best-effort restore to automatic mode.
         let _ = self
@@ -491,8 +491,7 @@ impl<T: Transport> OuraClient<T> {
     where
         F: FnMut(AcmSample),
     {
-        let mut rx = self.transport.subscribe();
-        while rx.try_recv().is_ok() {}
+        let mut rx = subscribe_fresh(&self.transport);
 
         let minutes = (duration.as_secs().div_ceil(60)).max(1) as u16;
         self.transport
@@ -503,22 +502,12 @@ impl<T: Transport> OuraClient<T> {
             ))
             .await?;
 
-        let deadline = tokio::time::Instant::now() + duration;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
+        stream_until(&mut rx, duration, |frame| {
+            for sample in parse_acm_frame(frame) {
+                on_sample(sample);
             }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(frame)) => {
-                    for sample in parse_acm_frame(&frame) {
-                        on_sample(sample);
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                _ => break,
-            }
-        }
+        })
+        .await;
 
         // Mandatory teardown: real-time measurements do not self-stop reliably.
         let _ = self.transport.write(&protocol::req_realtime_off()).await;
@@ -549,15 +538,6 @@ fn parse_acm_frame(frame: &[u8]) -> Vec<AcmSample> {
         });
     }
     out
-}
-
-/// Compute bpm from an inter-beat interval, ignoring implausible values.
-fn bpm_from_ibi(ibi_ms: u16) -> Option<u16> {
-    if (300..=2000).contains(&ibi_ms) {
-        Some((60_000u32 / ibi_ms as u32) as u16)
-    } else {
-        None
-    }
 }
 
 /// Parse a daytime-HR live subscription notification (tag `0x2f`, sub-tag `0x28`).
