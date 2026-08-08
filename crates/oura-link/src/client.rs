@@ -605,11 +605,11 @@ mod tests {
         mock.on("2f012b", &["2f102c0e2d6a0a08c99b4365f458e6e97382"]);
         // The encrypted authenticate request for this key+nonce, then success.
         mock.on(
-            "2f112da38a8772d3acb6db5c2b516dd56987c8",
+            "2f112d31e81e047a8239461303cceb32a602a7",
             &["2f022e00"],
         );
         let client = OuraClient::new(mock).with_quiet(Duration::from_millis(20));
-        let key: [u8; 16] = hex::decode("4431967d8bacc2659743142b68391d9a")
+        let key: [u8; 16] = hex::decode("000102030405060708090a0b0c0d0e0f")
             .unwrap()
             .try_into()
             .unwrap();

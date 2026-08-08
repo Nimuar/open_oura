@@ -245,9 +245,8 @@ class OuraBleService : Service() {
             return
         }
 
-        // Audit Log: Verify MAC and Key integrity (Log first 4 bytes of key only)
-        val keySnippet = authKey.take(4).joinToString("") { "%02x".format(it) }
-        Log.i(TAG, "◆ [CONN ATTEMPT] Target: $sanitizedMac | Key Prefix: $keySnippet... | Size: ${authKey.size}")
+        // Audit log: never log key material, only its length.
+        Log.i(TAG, "◆ [CONN ATTEMPT] Target: $sanitizedMac | Key size: ${authKey.size}")
 
         activeKey = authKey
         isPairingFlow = false
@@ -282,9 +281,8 @@ class OuraBleService : Service() {
             return
         }
 
-        // Audit Log: Verify generated key integrity
-        val keySnippet = generatedKey.take(4).joinToString("") { "%02x".format(it) }
-        Log.i(TAG, "◆ [PAIR ATTEMPT] Target: $sanitizedMac | New Key Prefix: $keySnippet... | Size: ${generatedKey.size}")
+        // Audit log: never log key material, only its length.
+        Log.i(TAG, "◆ [PAIR ATTEMPT] Target: $sanitizedMac | New key size: ${generatedKey.size}")
 
         activeKey = generatedKey
         isPairingFlow = true
