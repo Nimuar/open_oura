@@ -782,6 +782,10 @@ pub fn event_name(tag: u8) -> &'static str {
         0x8b => "spo2_r_pi_event",
         0x82 => "scan_start",
         0x83 => "scan_end",
+        0x84 => "ambient_event",
+        0x86 => "aohr_event",
+        0x87 => "atlas_metadata",
+        0x88 => "atlas_raw_bioz_data",
         _ => "unknown",
     }
 }
@@ -1024,6 +1028,261 @@ mod tests {
         let v = decode_state_text(&hex::decode("016368672e2073746f70706564").unwrap()).unwrap();
         assert_eq!(v["state"].as_u64().unwrap(), 1);
         assert_eq!(v["text"].as_str().unwrap(), "chg. stopped");
+    }
+
+    #[test]
+    fn decode_event_body_dispatches_every_known_tag() {
+        // (tag, body, a key the decoder must produce) — exercises the tag dispatch.
+        let cases: &[(u8, Vec<u8>, &str)] = &[
+            (0x42, vec![1, 0, 0, 0], "unix_time"),
+            (0x43, b"git;abc".to_vec(), "ascii"),
+            (0x45, vec![1, b'o', b'n'], "state"),
+            (0x46, vec![0x1c, 0x0d], "temps_c"),
+            (0x47, vec![0x6f, 0x0c, 0x1d, 0x07], "orientation"),
+            (0x49, vec![1, 0, 2, 0], "start_offset_min"),
+            (0x4b, vec![0, 0b00_01_10_11], "phases"),
+            (0x4c, vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0, 0, 0], "field_a_u64"),
+            (0x4e, vec![0, 0], "phases"),
+            (0x4f, vec![0x40, 0x20, 0x40, 0, 5, 0, 0, 0, 6, 0, 7], "field_a"),
+            (0x50, vec![3, 10], "met"),
+            (0x53, vec![1, b'o', b'n'], "state"),
+            (0x56, vec![7], "alert_type"),
+            (0x58, vec![9, 0, 0, 0, 10, 0, 11], "field_a_u32"),
+            (0x59, vec![0x10, 0x00], "ambient"),
+            (0x5a, vec![0, 0], "phases"),
+            (0x5b, vec![2, 3], "kind"),
+            (0x5d, vec![60, 40], "hr_bpm"),
+            (0x60, vec![0x64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "amplitude"),
+            (0x61, vec![0x11, 5, 0, 0, 0], "charging_time"),
+            (0x69, vec![0x6c, 0x0d], "temps_c"),
+            (0x6b, vec![0x30, 0xab], "motion_levels"),
+            (0x6c, vec![2, 1], "feature_id"),
+            (0x6f, vec![0, 97, 98], "spo2_percent"),
+            (0x72, vec![0xb1, 0, 0x46, 1, 0xf0, 0, 0x1e, 0, 0x3e, 0, 2, 0], "acm_mad"),
+            (0x74, vec![0x10, 0x00], "intensity"),
+            (0x75, vec![0x1c, 0x0d], "temps_c"),
+            (0x76, vec![0x74, 0x37, 0x61, 0, 0xe6, 0x36, 0x65, 0], "bedtime_start_ds"),
+            (0x79, vec![1, 2], "kind"),
+            (0x7e, vec![1, 2, 3, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "fields"),
+            (0x7f, vec![1, 2, 3, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "fields"),
+            (0x80, vec![0x9d, 0x09], "ibi_ms"),
+            (0x81, vec![0x80, 0x29], "ppg_samples"),
+            (0x82, vec![1], "kind"),
+            (0x83, vec![1], "kind"),
+            (0x84, vec![0x10, 0x00], "values"),
+            (0x86, vec![1, 0, 1, 50, 1], "bpm"),
+            (0x87, vec![0, 1, 0, 3, 4, 5, 6, 0, 0, 0], "sensor_type"),
+            (0x88, vec![5, 5], "samples"),
+            (0x8b, vec![0, 0x32, 0x1f, 0x8c], "perfusion_index"),
+        ];
+        for (tag, body, key) in cases {
+            let v = decode_event_body(*tag, body)
+                .unwrap_or_else(|| panic!("tag {tag:#04x} should decode"));
+            assert!(v.get(key).is_some(), "tag {tag:#04x} missing key {key}");
+            // A tag we can decode must also be named.
+            assert_ne!(event_name(*tag), "unknown", "tag {tag:#04x} has no name");
+        }
+        // Tags without a decoder stay raw.
+        assert!(decode_event_body(0x44, &[1, 2, 3]).is_none());
+        assert!(decode_event_body(0x00, &[]).is_none());
+    }
+
+    #[test]
+    fn malformed_bodies_stay_raw() {
+        // Each of these lengths/values is impossible for the tag, so the decoder
+        // must decline rather than emit a mis-decode.
+        let cases: &[(u8, Vec<u8>)] = &[
+            (0x42, vec![1, 0]),                          // time_sync too short
+            (0x43, vec![b' ', 0]),                       // ascii blank
+            (0x45, vec![]),                              // state text empty
+            (0x46, vec![0x1c]),                          // odd temperature length
+            (0x47, vec![1, 2, 3]),                       // motion too short
+            (0x49, vec![1, 0]),                          // sleep_summary_1 short
+            (0x4b, vec![0]),                             // sleep phases without data
+            (0x4c, vec![1, 2, 3]),                       // sleep_summary_2 wrong size
+            (0x4f, vec![1, 2, 3]),                       // sleep_summary_3 wrong size
+            (0x58, vec![1, 2, 3]),                       // sleep_summary_4 wrong size
+            (0x59, vec![1]),                             // odd u16 sample length
+            (0x5b, vec![]),                              // telemetry empty
+            (0x5d, vec![60]),                            // odd hrv pair length
+            (0x60, vec![1, 2, 3]),                       // ibi/amplitude not 14 bytes
+            (0x61, vec![]),                              // debug_data empty
+            (0x6b, vec![0x30]),                          // motion_period header only
+            (0x6c, vec![2]),                             // feature_session short
+            (0x6f, vec![0, 0xff]),                       // spo2 header + sentinel only
+            (0x72, vec![0; 11]),                         // sleep_acm_period short
+            (0x76, vec![0; 7]),                          // bedtime_period short
+            (0x7e, vec![0; 13]),                         // real_steps wrong size
+            (0x80, vec![0x9d]),                          // green ibi single byte
+            (0x81, vec![]),                              // cva ppg empty
+            (0x84, vec![1]),                             // ambient odd length
+            (0x86, vec![1, 0, 4, 50, 1]),                // aohr count/length mismatch
+            (0x87, vec![1, 1, 0, 3, 4, 5, 6, 0, 0, 0]),  // atlas metadata non-start subtype
+            (0x88, vec![]),                              // atlas bioz empty
+            (0x8b, vec![0, 0x32]),                       // spo2 r/pi truncated sample
+        ];
+        for (tag, body) in cases {
+            assert!(
+                decode_event_body(*tag, body).is_none(),
+                "tag {tag:#04x} should have stayed raw"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_u16_sample_streams() {
+        let ambient = decode_u16_samples(&[0x10, 0x00, 0x01, 0x02], "ambient").unwrap();
+        assert_eq!(ambient["ambient"], serde_json::json!([16, 513]));
+        let intensity = decode_u16_samples(&[0xff, 0xff], "intensity").unwrap();
+        assert_eq!(intensity["intensity"], serde_json::json!([65535]));
+    }
+
+    #[test]
+    fn decodes_spo2_dropping_continued_sentinel() {
+        let v = decode_spo2(&[0x01, 97, 96, 0xff]).unwrap();
+        assert_eq!(v["spo2_percent"], serde_json::json!([97, 96]));
+        // without the sentinel every byte after the header is a sample
+        let v = decode_spo2(&[0x01, 97, 96]).unwrap();
+        assert_eq!(v["spo2_percent"], serde_json::json!([97, 96]));
+    }
+
+    #[test]
+    fn decodes_ibi_amplitude_packet() {
+        // b[0]=100 -> ibi[0] = 100<<3 = 800 ms (75 bpm); all other beats read 0 and
+        // are dropped from hr_bpm as implausible.
+        let mut body = [0u8; 14];
+        body[0] = 100;
+        let v = decode_ibi_amplitude(&body).unwrap();
+        assert_eq!(v["ibi_ms"][0].as_u64().unwrap(), 800);
+        assert_eq!(v["hr_bpm"], serde_json::json!([75]));
+        assert_eq!(v["amplitude"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn decodes_alert_first_byte() {
+        assert_eq!(decode_first_byte(&[7, 9], "alert_type").unwrap()["alert_type"], 7);
+        assert!(decode_first_byte(&[], "alert_type").is_none());
+    }
+
+    #[test]
+    fn telemetry_keeps_subtype_and_raw_body() {
+        let v = decode_telemetry(&[0x02, 0xab], "scan_start").unwrap();
+        assert_eq!(v["kind"], "scan_start");
+        assert_eq!(v["subtype"], 2);
+        assert_eq!(v["raw"], "02ab");
+    }
+
+    #[test]
+    fn decodes_unvalidated_sleep_summaries() {
+        let s1 = decode_sleep_summary_1(&[0x10, 0x00, 0x20, 0x00]).unwrap();
+        assert_eq!((s1["start_offset_min"].as_u64(), s1["end_offset_min"].as_u64()), (Some(16), Some(32)));
+
+        let s2 = decode_sleep_summary_2(&[1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0, 0, 0]).unwrap();
+        assert_eq!(s2["field_a_u64"], 1);
+        assert_eq!(s2["field_b_u16"], 2);
+        assert_eq!(s2["field_c_u32"], 3);
+
+        let s3 = decode_sleep_summary_3(&[0x40, 0x20, 0x40, 0x00, 5, 0, 0, 0, 6, 0, 7]).unwrap();
+        assert_eq!(s3["field_a"], 8); // 0x40 >> 3
+        assert_eq!(s3["field_b"], 4); // 0x20 >> 3
+        assert_eq!(s3["field_c"], 8); // 0x0040 >> 3
+        assert_eq!(s3["field_d_u32"], 5);
+        assert_eq!(s3["field_e_u16"], 6);
+        assert_eq!(s3["field_f_u8"], 7);
+
+        let s4 = decode_sleep_summary_4(&[9, 0, 0, 0, 10, 0, 11]).unwrap();
+        assert_eq!((s4["field_a_u32"].as_u64(), s4["field_b_u16"].as_u64(), s4["field_c_u8"].as_u64()), (Some(9), Some(10), Some(11)));
+
+        for v in [s1, s2, s3, s4] {
+            assert_eq!(v["_status"], "unvalidated");
+        }
+    }
+
+    #[test]
+    fn decodes_real_steps_bit_packing() {
+        // p[3]'s top bit is the 9th bit of field 0: (0x80>>7) | (1<<1) = 3.
+        let mut body = [0u8; 14];
+        body[0] = 1;
+        body[1] = 2;
+        body[2] = 3;
+        body[3] = 0x80;
+        let v = decode_real_steps(&body).unwrap();
+        let fields = v["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 14);
+        assert_eq!(fields[0], 3);
+        assert_eq!(fields[1], 4);
+        assert_eq!(fields[2], 6);
+        assert_eq!(fields[3], 0); // low 7 bits of p[3]
+    }
+
+    #[test]
+    fn decodes_atlas_metadata_start_form() {
+        let v = decode_atlas_metadata(&[0, 1, 0, 3, 4, 5, 6, 0, 0, 0]).unwrap();
+        assert_eq!(v["sensor_type"], 1);
+        assert_eq!(v["cfg_a"], 3);
+        assert_eq!(v["cfg_b"], 4);
+        assert_eq!(v["channel_count"], 5);
+        assert_eq!(v["cfg_word"], 6);
+    }
+
+    #[test]
+    fn debug_data_charging_and_unknown_subtypes() {
+        let charging = decode_debug_data(&[0x11, 5, 0, 0, 0]).unwrap();
+        assert_eq!(charging["kind"], "charging_time");
+        assert_eq!(charging["charging_time"], 5);
+
+        // battery record with the trailing flag byte
+        let battery = decode_debug_data(&[0x24, 95, 0x68, 0x10, 0x03]).unwrap();
+        assert_eq!((battery["flag_a"].as_u64(), battery["flag_b"].as_u64()), (Some(1), Some(1)));
+
+        let unknown = decode_debug_data(&[0x07, 0x01]).unwrap();
+        assert_eq!(unknown["kind"], "debug_data");
+        assert_eq!(unknown["subtype"], 7);
+        assert_eq!(unknown["raw"], "0701");
+        assert_eq!(unknown["_status"], "unvalidated");
+    }
+
+    #[test]
+    fn motion_event_rejects_reserved_intensity_bit() {
+        // bit 6 set in either intensity byte means the layout isn't what we assume
+        assert!(decode_motion(&[0x6f, 0x0c, 0x1d, 0x07, 0x40]).is_none());
+        assert!(decode_motion(&[0x6f, 0x0c, 0x1d, 0x07, 0x0c, 0x40]).is_none());
+    }
+
+    #[test]
+    fn event_names_cover_the_documented_tag_range() {
+        assert_eq!(event_name(0x41), "ring_start");
+        assert_eq!(event_name(0x61), "debug_data");
+        assert_eq!(event_name(0x8b), "spo2_r_pi_event");
+        assert_eq!(event_name(0x00), "unknown");
+        assert_eq!(event_name(0xff), "unknown");
+        // Gaps in the taxonomy (no event uses these tags).
+        const GAPS: [u8; 7] = [0x78, 0x7b, 0x7c, 0x7d, 0x85, 0x89, 0x8a];
+        for tag in 0x41..=0x8bu8 {
+            let name = event_name(tag);
+            if GAPS.contains(&tag) {
+                assert_eq!(name, "unknown", "tag {tag:#04x} unexpectedly named");
+            } else {
+                assert_ne!(name, "unknown", "tag {tag:#04x} should have a name");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_summary_rejects_other_frames() {
+        // wrong tag
+        assert!(EventBatchSummary::parse(&Packet::new(0x10, vec![0; 6])).is_none());
+        // right tag, truncated payload
+        assert!(EventBatchSummary::parse(&Packet::new(0x11, vec![0; 5])).is_none());
+    }
+
+    #[test]
+    fn event_from_short_packet_has_no_timestamp_or_body() {
+        let ev = RingEvent::from_packet(&Packet::new(0x44, vec![1, 2]));
+        assert_eq!(ev.name, "ibi_event");
+        assert_eq!(ev.timestamp, 0);
+        assert!(ev.body.is_empty());
+        assert!(ev.decoded.is_none());
     }
 
     #[test]

@@ -120,8 +120,13 @@ mod tests {
     use super::*;
     use std::ffi::CStr;
 
+    /// The diagnostics queue is process-global and every FFI entry point writes to
+    /// it, so tests that inspect it must not run alongside tests that log.
+    static DIAGNOSTICS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_event_name() {
+        let _guard = DIAGNOSTICS.lock();
         let name_ptr = oura_event_name(0x42);
         assert!(!name_ptr.is_null());
         let c_str = unsafe { CStr::from_ptr(name_ptr) };
@@ -131,6 +136,7 @@ mod tests {
 
     #[test]
     fn test_decode_event_time_sync() {
+        let _guard = DIAGNOSTICS.lock();
         // time_sync payload is 4-byte LE unix timestamp.
         let body = [0x01, 0x02, 0x03, 0x04];
         let json_ptr = oura_decode_event(0x42, body.as_ptr(), body.len());
@@ -144,6 +150,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_nonce() {
+        let _guard = DIAGNOSTICS.lock();
         let key = [0u8; 16];
         let nonce = [1u8; 15];
         let mut out = [0u8; 16];
@@ -155,6 +162,7 @@ mod tests {
 
     #[test]
     fn test_diagnostics_queue() {
+        let _guard = DIAGNOSTICS.lock();
         // Clear queue first by popping everything
         while !oura_pop_diagnostic().is_null() {}
 
@@ -175,5 +183,71 @@ mod tests {
 
         let empty_ptr = oura_pop_diagnostic();
         assert!(empty_ptr.is_null());
+    }
+
+    #[test]
+    fn diagnostics_queue_drops_oldest_beyond_capacity() {
+        let _guard = DIAGNOSTICS.lock();
+        while !oura_pop_diagnostic().is_null() {}
+
+        for i in 0..505 {
+            log_diagnostic(&format!("log {i}"));
+        }
+        let first = oura_pop_diagnostic();
+        let text = unsafe { CStr::from_ptr(first) }.to_str().unwrap().to_string();
+        oura_string_free(first);
+        // The queue holds the newest 500 entries, so 0-4 have been dropped.
+        assert_eq!(text, "log 5");
+
+        let mut remaining = 1;
+        loop {
+            let ptr = oura_pop_diagnostic();
+            if ptr.is_null() {
+                break;
+            }
+            oura_string_free(ptr);
+            remaining += 1;
+        }
+        assert_eq!(remaining, 500);
+    }
+
+    #[test]
+    fn encrypt_nonce_rejects_bad_arguments() {
+        let _guard = DIAGNOSTICS.lock();
+        let key = [0u8; 16];
+        let nonce = [1u8; 15];
+        let mut out = [0u8; 16];
+        // wrong key length
+        assert_eq!(
+            oura_encrypt_nonce(key.as_ptr(), 8, nonce.as_ptr(), nonce.len(), out.as_mut_ptr()),
+            -1
+        );
+        // null pointers
+        assert_eq!(
+            oura_encrypt_nonce(std::ptr::null(), 16, nonce.as_ptr(), nonce.len(), out.as_mut_ptr()),
+            -1
+        );
+        assert_eq!(
+            oura_encrypt_nonce(key.as_ptr(), 16, std::ptr::null(), 15, out.as_mut_ptr()),
+            -1
+        );
+        assert_eq!(
+            oura_encrypt_nonce(key.as_ptr(), 16, nonce.as_ptr(), nonce.len(), std::ptr::null_mut()),
+            -1
+        );
+    }
+
+    #[test]
+    fn decode_event_returns_null_when_undecodable() {
+        let _guard = DIAGNOSTICS.lock();
+        // no decoder for this tag
+        assert!(oura_decode_event(0x44, [1u8, 2].as_ptr(), 2).is_null());
+        // a null/empty body is treated as an empty slice, not dereferenced
+        assert!(oura_decode_event(0x42, std::ptr::null(), 0).is_null());
+    }
+
+    #[test]
+    fn string_free_tolerates_null() {
+        oura_string_free(std::ptr::null_mut());
     }
 }

@@ -24,3 +24,32 @@ impl From<btleplug::Error> for Error {
         Error::Ble(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn btleplug_errors_become_ble_errors() {
+        let err: Error = btleplug::Error::DeviceNotFound.into();
+        assert!(matches!(err, Error::Ble(_)));
+        assert_eq!(err.to_string(), "ble error: Device not found");
+    }
+
+    #[test]
+    fn io_errors_are_transparent() {
+        let err: Error = std::io::Error::other("disconnected").into();
+        assert_eq!(err.to_string(), "disconnected");
+    }
+
+    #[test]
+    fn messages_name_the_failing_layer() {
+        assert_eq!(Error::DeviceNotFound.to_string(), "no matching Oura ring found");
+        assert_eq!(
+            Error::CharacteristicNotFound("98ed0002".into()).to_string(),
+            "characteristic not found: 98ed0002"
+        );
+        assert_eq!(Error::Auth("no nonce".into()).to_string(), "authentication failed: no nonce");
+        assert_eq!(Error::Protocol("no battery".into()).to_string(), "protocol error: no battery");
+    }
+}
