@@ -49,6 +49,24 @@ impl RingEvent {
     }
 }
 
+/// Round to `places` decimals: decoded JSON keeps the device's real precision
+/// instead of the float artefacts of the fixed-point conversions below.
+fn round_to(v: f64, places: i32) -> f64 {
+    let f = 10f64.powi(places);
+    (v * f).round() / f
+}
+
+/// Heart rate (bpm) from an inter-beat interval, or `None` when the interval is
+/// outside the physiologically plausible 300..=2000 ms window (i.e. sensor noise
+/// rather than a beat).
+pub fn bpm_from_ibi(ibi_ms: u16) -> Option<u16> {
+    if (300..=2000).contains(&ibi_ms) {
+        Some((60_000u32 / ibi_ms as u32) as u16)
+    } else {
+        None
+    }
+}
+
 /// Decode an event body for a given tag. Public entry point for re-decoding
 /// events already stored raw (e.g. after adding new decoders).
 pub fn decode_event_body(tag: u8, body: &[u8]) -> Option<serde_json::Value> {
@@ -164,7 +182,7 @@ fn decode_time_sync(body: &[u8]) -> Option<serde_json::Value> {
     if body.len() < 4 {
         return None;
     }
-    let unix = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let unix = le32(body, 0);
     Some(serde_json::json!({ "unix_time": unix }))
 }
 
@@ -193,7 +211,7 @@ fn decode_temperatures(body: &[u8]) -> Option<serde_json::Value> {
         if !(-40.0..=85.0).contains(&celsius) {
             return None;
         }
-        temps.push((celsius * 100.0).round() / 100.0);
+        temps.push(round_to(celsius, 2));
     }
     Some(serde_json::json!({ "temps_c": temps }))
 }
@@ -212,8 +230,8 @@ fn decode_green_ibi_quality(body: &[u8]) -> Option<serde_json::Value> {
     for p in body.chunks_exact(2) {
         let ibi = ((p[1] & 0x07) as u16) | ((p[0] as u16) << 3);
         let q = (p[1] >> 3) & 0x03;
-        if q == 1 && (300..=2000).contains(&ibi) {
-            hr_bpm.push(60_000u32 / ibi as u32);
+        if q == 1 {
+            hr_bpm.extend(bpm_from_ibi(ibi));
         }
         ibi_ms.push(ibi);
         quality.push(q);
@@ -266,7 +284,7 @@ fn decode_activity_info(body: &[u8]) -> Option<serde_json::Value> {
             } else {
                 12.8 + (b as f64 - 128.0) * 0.2
             };
-            (m * 100.0).round() / 100.0
+            round_to(m, 2)
         })
         .collect();
     Some(serde_json::json!({ "state": state, "met": met }))
@@ -325,11 +343,7 @@ fn decode_ibi_amplitude(body: &[u8]) -> Option<serde_json::Value> {
     let shift = if (b[13] & 0x0f) == 7 { 0 } else { (b[13] & 0x0f) + 1 };
     let amplitude: Vec<u32> = (0..6).map(|k| ((b[6 + k] >> 1) as u32) << shift).collect();
     // heart rate from plausible beats (validated on overnight data ~ median 41 bpm)
-    let hr_bpm: Vec<u16> = ibi_ms
-        .iter()
-        .filter(|&&i| (300..=2000).contains(&i))
-        .map(|&i| 60_000 / i)
-        .collect();
+    let hr_bpm: Vec<u16> = ibi_ms.iter().filter_map(|&i| bpm_from_ibi(i)).collect();
     Some(serde_json::json!({ "ibi_ms": ibi_ms, "amplitude": amplitude, "hr_bpm": hr_bpm }))
 }
 
@@ -345,8 +359,8 @@ fn decode_spo2_r_pi(body: &[u8]) -> Option<serde_json::Value> {
     let mut o = 1;
     while o + 3 <= body.len() {
         let rv = u16::from_be_bytes([body[o], body[o + 1]]) as f64 / 16384.0;
-        r.push((rv * 1000.0).round() / 1000.0);
-        pi.push(((body[o + 2] as f64 / 255.0 * 0.05) * 10000.0).round() / 10000.0);
+        r.push(round_to(rv, 3));
+        pi.push(round_to(body[o + 2] as f64 / 255.0 * 0.05, 4));
         o += 3;
     }
     Some(serde_json::json!({ "r": r, "perfusion_index": pi }))
@@ -359,7 +373,7 @@ fn decode_sleep_acm_period(body: &[u8]) -> Option<serde_json::Value> {
     if body.len() < 12 {
         return None;
     }
-    let r4 = |v: f64| (v * 10000.0).round() / 10000.0;
+    let r4 = |v: f64| round_to(v, 4);
     let fp = |frac: u8, intg: u8| intg as f64 + frac as f64 / 255.0;
     let q12 = |lo: u8, hi: u8| ((lo as u16 | ((hi as u16 & 0x0f) << 8)) as f64 / 4095.0) + (hi >> 4) as f64;
     let vals = [
@@ -410,13 +424,13 @@ fn decode_bedtime_period(body: &[u8]) -> Option<serde_json::Value> {
     if body.len() < 8 {
         return None;
     }
-    let start = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-    let end = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    let start = le32(body, 0);
+    let end = le32(body, 4);
     let hours = end.saturating_sub(start) as f64 / 10.0 / 3600.0;
     Some(serde_json::json!({
         "bedtime_start_ds": start,
         "bedtime_end_ds": end,
-        "duration_hours": (hours * 100.0).round() / 100.0,
+        "duration_hours": round_to(hours, 2),
     }))
 }
 

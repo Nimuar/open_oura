@@ -147,21 +147,28 @@ class OuraBleService : Service() {
         }
     }
 
-    private fun loadEventHistory() {
+    private val historyFile: File
+        get() = File(filesDir, "oura_history.json")
+
+    /** Event JSON strings cached on disk; empty when the file is absent or unreadable. */
+    private fun readHistoryFile(): MutableList<String> {
+        val list = mutableListOf<String>()
         try {
-            val file = File(filesDir, "oura_history.json")
+            val file = historyFile
             if (file.exists()) {
-                val content = file.readText()
-                val jsonArray = JSONArray(content)
-                val list = mutableListOf<String>()
+                val jsonArray = JSONArray(file.readText())
                 for (i in 0 until jsonArray.length()) {
                     list.add(jsonArray.getString(i))
                 }
-                _decodedEventHistory.value = list
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load event history: ${e.message}")
         }
+        return list
+    }
+
+    private fun loadEventHistory() {
+        _decodedEventHistory.value = readHistoryFile()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -232,11 +239,29 @@ class OuraBleService : Service() {
     /**
      * Connect to an already paired ring MAC address.
      */
-    fun connectToDevice(macAddress: String, authKey: ByteArray) {
+    fun connectToDevice(macAddress: String, authKey: ByteArray) =
+        startConnection(macAddress, authKey, pairing = false)
+
+    /**
+     * Scan and Pair with a factory-reset ring.
+     */
+    fun pairNewRing(macAddress: String, generatedKey: ByteArray) =
+        startConnection(macAddress, generatedKey, pairing = true)
+
+    /**
+     * Open a GATT link and remember [key] for the handshake that the descriptor
+     * write kicks off. A pairing run installs the key first, so it may also start
+     * from [ConnectionState.Scanning].
+     */
+    private fun startConnection(macAddress: String, key: ByteArray, pairing: Boolean) {
         val sanitizedMac = macAddress.uppercase()
         val currentState = connectionState.value
-        if (currentState != ConnectionState.Idle && currentState !is ConnectionState.Failed) {
-            Log.w(TAG, "Ignoring connect request for $sanitizedMac: Already in state $currentState")
+        val acceptable = currentState == ConnectionState.Idle ||
+            currentState is ConnectionState.Failed ||
+            (pairing && currentState == ConnectionState.Scanning)
+        if (!acceptable) {
+            val kind = if (pairing) "pairing" else "connect"
+            Log.w(TAG, "Ignoring $kind request for $sanitizedMac: Already in state $currentState")
             return
         }
 
@@ -246,52 +271,18 @@ class OuraBleService : Service() {
         }
 
         // Audit Log: Verify MAC and Key integrity (Log first 4 bytes of key only)
-        val keySnippet = authKey.take(4).joinToString("") { "%02x".format(it) }
-        Log.i(TAG, "◆ [CONN ATTEMPT] Target: $sanitizedMac | Key Prefix: $keySnippet... | Size: ${authKey.size}")
+        val keySnippet = key.take(4).joinToString("") { "%02x".format(it) }
+        val attempt = if (pairing) "PAIR ATTEMPT" else "CONN ATTEMPT"
+        val keyLabel = if (pairing) "New Key Prefix" else "Key Prefix"
+        Log.i(TAG, "◆ [$attempt] Target: $sanitizedMac | $keyLabel: $keySnippet... | Size: ${key.size}")
 
-        activeKey = authKey
-        isPairingFlow = false
+        activeKey = key
+        isPairingFlow = pairing
         val device = bluetoothAdapter!!.getRemoteDevice(sanitizedMac)
 
-        updateConnectionState(ConnectionState.Connecting, "Manual connection started for $sanitizedMac")
-        updateNotification("Connecting to Oura Ring...")
-
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            bluetoothGatt = device.connectGatt(
-                applicationContext,
-                false,
-                gattCallback,
-                BluetoothDevice.TRANSPORT_LE
-            )
-        }
-    }
-
-    /**
-     * Scan and Pair with a factory-reset ring.
-     */
-    fun pairNewRing(macAddress: String, generatedKey: ByteArray) {
-        val sanitizedMac = macAddress.uppercase()
-        val currentState = connectionState.value
-        if (currentState != ConnectionState.Idle && currentState !is ConnectionState.Failed && currentState != ConnectionState.Scanning) {
-            Log.w(TAG, "Ignoring pairing request for $sanitizedMac: Already in state $currentState")
-            return
-        }
-
-        if (bluetoothAdapter == null) {
-            updateConnectionState(ConnectionState.Failed("Bluetooth unsupported"), "No BT Adapter")
-            return
-        }
-
-        // Audit Log: Verify generated key integrity
-        val keySnippet = generatedKey.take(4).joinToString("") { "%02x".format(it) }
-        Log.i(TAG, "◆ [PAIR ATTEMPT] Target: $sanitizedMac | New Key Prefix: $keySnippet... | Size: ${generatedKey.size}")
-
-        activeKey = generatedKey
-        isPairingFlow = true
-        val device = bluetoothAdapter!!.getRemoteDevice(sanitizedMac)
-
-        updateConnectionState(ConnectionState.Connecting, "Pairing sequence started for $sanitizedMac")
-        updateNotification("Pairing with Oura Ring...")
+        val reason = if (pairing) "Pairing sequence started" else "Manual connection started"
+        updateConnectionState(ConnectionState.Connecting, "$reason for $sanitizedMac")
+        updateNotification(if (pairing) "Pairing with Oura Ring..." else "Connecting to Oura Ring...")
 
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             bluetoothGatt = device.connectGatt(
@@ -513,11 +504,7 @@ class OuraBleService : Service() {
 
             for (p in batch.events) {
                 if (p.payload.size < 4) continue
-                // Parse timestamp (4 bytes LE)
-                val ts = ((p.payload[0].toInt() and 0xff) or
-                          ((p.payload[1].toInt() and 0xff) shl 8) or
-                          ((p.payload[2].toInt() and 0xff) shl 16) or
-                          ((p.payload[3].toInt() and 0xff) shl 24)).toLong() and 0xffffffffL
+                val ts = p.payload.le32(0)
 
                 if (ts > maxTs) {
                     maxTs = ts
@@ -567,42 +554,21 @@ class OuraBleService : Service() {
     private suspend fun getEventBatch(start: Int): EventBatch {
         val evs = mutableListOf<Packet>()
         var bytesLeft = 0
-        var finished = false
-        val job = Job()
 
-        val listener = { p: Packet ->
-            if (p.tag == 0x11.toByte()) {
-                if (p.payload.size >= 6) {
-                    bytesLeft = ((p.payload[2].toInt() and 0xff) or
-                                 ((p.payload[3].toInt() and 0xff) shl 8) or
-                                 ((p.payload[4].toInt() and 0xff) shl 16) or
-                                 ((p.payload[5].toInt() and 0xff) shl 24))
+        awaitPackets(2000, Req.getEvent(start, 255.toByte(), -1)) { p ->
+            when {
+                // The batch summary terminates the batch.
+                p.tag == 0x11.toByte() -> {
+                    if (p.payload.size >= 6) {
+                        bytesLeft = p.payload.le32(2).toInt()
+                    }
+                    true
                 }
-                finished = true
-                job.complete()
-                true
-            } else if (p.tag >= OuraGATT.HISTORY_EVENT_PREFIX) {
-                evs.add(p)
-                false
-            } else {
-                false
-            }
-        }
-
-        synchronized(responseListeners) {
-            responseListeners.add(listener)
-        }
-
-        // Request events
-        writeRaw(Req.getEvent(start, 255.toByte(), -1))
-
-        try {
-            kotlinx.coroutines.withTimeout(2000) {
-                job.join()
-            }
-        } catch (e: Exception) {
-            synchronized(responseListeners) {
-                responseListeners.remove(listener)
+                p.tag >= OuraGATT.HISTORY_EVENT_PREFIX -> {
+                    evs.add(p)
+                    false
+                }
+                else -> false
             }
         }
 
@@ -611,17 +577,8 @@ class OuraBleService : Service() {
 
     private fun saveEventsToFile(eventsJson: List<String>) {
         try {
-            val file = File(filesDir, "oura_history.json")
-            val existingEvents = mutableListOf<String>()
-
-            // Load existing
-            if (file.exists()) {
-                val content = file.readText()
-                val jsonArray = JSONArray(content)
-                for (i in 0 until jsonArray.length()) {
-                    existingEvents.add(jsonArray.getString(i))
-                }
-            }
+            val file = historyFile
+            val existingEvents = readHistoryFile()
 
             // Append new
             existingEvents.addAll(eventsJson)
@@ -720,32 +677,52 @@ class OuraBleService : Service() {
 
     private suspend fun waitForPacket(timeoutMs: Long = 3000, condition: (Packet) -> Boolean): Packet? {
         var result: Packet? = null
+        awaitPackets(timeoutMs) { packet ->
+            condition(packet).also { if (it) result = packet }
+        }
+        return result
+    }
+
+    /**
+     * Feed inbound packets to [onPacket] until it reports the exchange is complete
+     * (returns true) or [timeoutMs] elapses. [request], when given, is written only
+     * after the listener is registered so a fast response cannot be missed.
+     */
+    private suspend fun awaitPackets(
+        timeoutMs: Long,
+        request: ByteArray? = null,
+        onPacket: (Packet) -> Boolean
+    ) {
         val job = Job()
         val listener = { packet: Packet ->
-            if (condition(packet)) {
-                result = packet
-                job.complete()
-                true
-            } else {
-                false
-            }
+            onPacket(packet).also { if (it) job.complete() }
         }
 
         synchronized(responseListeners) {
             responseListeners.add(listener)
         }
 
+        request?.let { writeRaw(it) }
+
         try {
             kotlinx.coroutines.withTimeout(timeoutMs) {
                 job.join()
             }
         } catch (e: Exception) {
+            Log.d(TAG, "Timed out waiting for a matching packet")
+        } finally {
             synchronized(responseListeners) {
                 responseListeners.remove(listener)
             }
         }
-        return result
     }
+
+    /** Unsigned 32-bit little-endian value at [offset]. */
+    private fun ByteArray.le32(offset: Int): Long =
+        (this[offset].toLong() and 0xff) or
+            ((this[offset + 1].toLong() and 0xff) shl 8) or
+            ((this[offset + 2].toLong() and 0xff) shl 16) or
+            ((this[offset + 3].toLong() and 0xff) shl 24)
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

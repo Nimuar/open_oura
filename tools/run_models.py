@@ -9,60 +9,35 @@ Usage: python tools/run_models.py <model> [DB] [--tz H]
   model = bdi | daily_medians | all
 (sleepnet_moonstone has its own runner: tools/run_sleep_model.py)
 """
-import datetime
 import json
 import sys
-import sqlite3
-from pathlib import Path
 
-import torch
-
-from _common import resolve_db
-
-REPO = Path(__file__).resolve().parent.parent
-MODELS = REPO / "notes" / "models"
-
-
-def load(name):
-    return torch.jit.load(str(MODELS / f"{name}.pt"), map_location="cpu").eval()
+from _common import (
+    DsClock,
+    connect,
+    decoded_events,
+    ibi_valid,
+    latest_bedtime_from_rows,
+    local_dt,
+    resolve_db,
+)
+from _models import f32, i64, load_model
 
 
 def events(db):
-    con = sqlite3.connect(db)
-    rows = con.execute(
-        "SELECT ring_timestamp, name, decoded_json, captured_unix FROM events "
-        "WHERE decoded_json IS NOT NULL ORDER BY ring_timestamp"
-    ).fetchall()
+    con = connect(db)
+    rows = decoded_events(con)
     con.close()
     return rows
-
-
-def anchor(rows):
-    max_ds, anchor_unix = max(((r[0], r[3]) for r in rows), key=lambda x: x[0])
-    def unix_s(ds):  # ring deciseconds -> unix seconds
-        return anchor_unix - (max_ds - ds) / 10.0
-    return unix_s
-
-
-def f32(x):
-    return torch.tensor(x, dtype=torch.float32)
-
-
-def last_bedtime(rows):
-    """Most recent bedtime_period dict, or a clear error if none were synced."""
-    beds = [json.loads(j) for ds, n, j, _ in rows if n == "bedtime_period"]
-    if not beds:
-        sys.exit("no bedtime_period (tag 0x76) in DB — sync overnight data first")
-    return beds[-1]
 
 
 # ---- sleepnet_bdi_0_4_0: bedtime_input, ibi_values, ibi_timestamps ----
 def run_bdi(db, tz):
     rows = events(db)
-    unix_s = anchor(rows)
-    bp = last_bedtime(rows)
-    bstart = unix_s(bp["bedtime_start_ds"])
-    bend = unix_s(bp["bedtime_end_ds"])
+    clock = DsClock(rows)
+    bp = latest_bedtime_from_rows(rows)
+    bstart = clock.unix(bp["bedtime_start_ds"])
+    bend = clock.unix(bp["bedtime_end_ds"])
     # IBIs within the sleep window (absolute beat timeline by cumulative IBI)
     # ibi_values = [ibi_ms, amplitude, quality(1=valid)]; timestamps passed separately.
     ibi_rows, ibi_t = [], []
@@ -71,7 +46,7 @@ def run_bdi(db, tz):
         # stream carries most overnight beats (matches run_sleep_model.py)
         if n not in ("ibi_and_amplitude_event", "green_ibi_quality_event"):
             continue
-        t0 = unix_s(ds)
+        t0 = clock.unix(ds)
         if not (bstart - 600 <= t0 <= bend + 600):  # ±10 min margin, matches run_sleep_model.py
             continue
         d = json.loads(j)
@@ -81,18 +56,18 @@ def run_bdi(db, tz):
         for k, ms in enumerate(ibis):
             if ms and ms > 0:
                 amp = amps[k] if k < len(amps) else 0
-                valid = 1.0 if 300 <= ms <= 2000 else 0.0  # quality flag (matches run_sleep_model.py)
+                valid = 1.0 if ibi_valid(ms) else 0.0  # quality flag (matches run_sleep_model.py)
                 ibi_rows.append([float(ms), float(amp), valid])
                 acc += ms  # a beat occurs at the END of its interval
                 ibi_t.append((t0 * 1000.0) + acc)  # ms
-    local = lambda s: datetime.datetime.utcfromtimestamp(s + tz * 3600).strftime("%Y-%m-%d %H:%M")
+    local = lambda s: local_dt(s, tz).strftime("%Y-%m-%d %H:%M")
     print(f"bedtime {local(bstart)} → {local(bend)} ({(bend-bstart)/3600:.2f} h), {len(ibi_rows)} IBIs")
     if not ibi_rows:
         sys.exit("no valid IBI in the sleep window — sync overnight IBI (0x60/0x80) data first")
-    m = load("sleepnet_bdi_0_4_0")
-    bedtime_input = torch.tensor([int(bstart * 1000), int(bend * 1000)], dtype=torch.long)
+    m = load_model("sleepnet_bdi_0_4_0")
+    bedtime_input = i64([int(bstart * 1000), int(bend * 1000)])
     ibi_vals = f32(ibi_rows)  # [N,3]
-    ibi_ts = torch.tensor([int(t) for t in ibi_t], dtype=torch.long)
+    ibi_ts = i64([int(t) for t in ibi_t])
     # outputs (names from app SleepNetBdiPyTorchV04Model.ModelOutput):
     #   timestamps, sleepStages[N,5], apneaEvents[N,2], outputMetrics[6], debugMetrics[10]
     timestamps, sleep_stages, apnea_events, out_metrics, dbg_metrics = m(bedtime_input, ibi_vals, ibi_ts)
@@ -115,14 +90,13 @@ def run_bdi(db, tz):
 
 # ---- daily_medians_1_1_0: HRV/HR/temp/MET medians over a day ----
 def run_daily_medians(db, _tz):  # no wall-clock output → tz unused here
-    import json
     rows = events(db)
-    unix_s = anchor(rows)
+    clock = DsClock(rows)
     hrv, hrv_t, hr_min = [], [], []
     temp, temp_t = [], []
     met, met_t = [], []
     for ds, n, j, _ in rows:
-        t = unix_s(ds)
+        t = clock.unix(ds)
         d = json.loads(j)
         if n == "hrv_event":
             iv = d.get("interval_min", 5) * 60
@@ -137,17 +111,16 @@ def run_daily_medians(db, _tz):  # no wall-clock output → tz unused here
         elif n == "activity_information":
             for k, v in enumerate(d.get("met", [])):
                 met.append(float(v)); met_t.append(int((t + k * 60) * 1000))
-    bp = last_bedtime(rows)
-    sleep_ts = [int(unix_s(bp["bedtime_start_ds"]) * 1000), int(unix_s(bp["bedtime_end_ds"]) * 1000)]
+    bp = latest_bedtime_from_rows(rows)
+    sleep_ts = [clock.ms(bp["bedtime_start_ds"]), clock.ms(bp["bedtime_end_ds"])]
     print(f"hrv={len(hrv)} temp={len(temp)} met={len(met)} hr_min={len(hr_min)}")
-    m = load("daily_medians_1_1_0")
-    L = torch.long
+    m = load_model("daily_medians_1_1_0")
     out = m(
-        f32(hrv), f32([1.0] * len(hrv)), torch.tensor(hrv_t, dtype=L),
+        f32(hrv), f32([1.0] * len(hrv)), i64(hrv_t),
         f32(hr_min),
-        f32(temp), torch.tensor(temp_t, dtype=L),
-        f32(met), torch.tensor(met_t, dtype=L),
-        torch.tensor(sleep_ts, dtype=L),
+        f32(temp), i64(temp_t),
+        f32(met), i64(met_t),
+        i64(sleep_ts),
     )
     print("OUTPUT:", [tuple(o.shape) for o in out])
     for i, o in enumerate(out):
@@ -172,7 +145,7 @@ def main():
         del argv[i:i + 2]
     model = argv[0] if argv else "bdi"
     db_arg = next((a for a in argv[1:] if not a.startswith("-")), None)
-    db = str(resolve_db(db_arg, REPO))
+    db = str(resolve_db(db_arg))
     if model == "all":
         for k, fn in RUNNERS.items():
             print("=" * 70, k)

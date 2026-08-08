@@ -20,15 +20,12 @@ Usage: python tools/run_spo2.py [DB] [--hw gen4|cooper] [--night]
 """
 import argparse
 import json
-import sqlite3
 import sys
-from pathlib import Path
 
 import numpy as np
 
-from _common import resolve_db
+from _common import connect, latest_bedtime, resolve_db
 
-REPO = Path(__file__).resolve().parent.parent
 COEFFS = {"gen4": (-13.4, -5.1, 105.2), "cooper": (-12.1, -6.9, 106.3)}
 
 
@@ -38,14 +35,11 @@ def main():
     p.add_argument("--hw", default="gen4", choices=list(COEFFS))
     p.add_argument("--night", action="store_true", help="restrict to the most recent bedtime_period window")
     args = p.parse_args()
-    con = sqlite3.connect(str(resolve_db(args.db, REPO)))
+    con = connect(resolve_db(args.db))
 
     where, params = "name='spo2_r_pi_event'", ()
     if args.night:
-        bt = con.execute("SELECT decoded_json FROM events WHERE tag=118 ORDER BY ring_timestamp DESC").fetchone()
-        if bt is None:
-            sys.exit("no bedtime_period — drop --night or sync overnight data")
-        v = json.loads(bt[0])
+        v = latest_bedtime(con, hint="drop --night or sync overnight data")
         where += " AND ring_timestamp BETWEEN ? AND ?"
         params = (v["bedtime_start_ds"], v["bedtime_end_ds"])
 
