@@ -361,7 +361,7 @@ function die(){state='dead';best=Math.max(best,Math.floor(score));localStorage.r
  $('cbig').classList.remove('hidden');$('cbig').textContent=Math.floor(score);}
 function showCenter(t,big,hint){$('center').classList.remove('hidden');$('ctitle').textContent=t;
  if(big===''){$('cbig').classList.add('hidden');}else{$('cbig').classList.remove('hidden');$('cbig').textContent=big;}
- $('cbody').style.display=(t==='RING RUNNER')?'block':'none';$('chint').innerHTML=hint||'';}
+ $('cbody').style.display=(t==='RING RUNNER')?'block':'none';$('chint').textContent=hint||'';}
 function hideCenter(){$('center').classList.add('hidden');}
 function spawnRock(z){const s=0.2+Math.pow(Math.random(),2.3)*3.2;   // lots of small, rare big
  const spread=4.2+s*1.7;                                            // big boulders sit wider out (scenery)

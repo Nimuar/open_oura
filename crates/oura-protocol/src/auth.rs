@@ -66,12 +66,13 @@ mod tests {
 
     #[test]
     fn known_answer_vector() {
-        // Verified against the Python reference (AES/ECB/PKCS5) used in tools/.
-        let key = hex::decode("4431967d8bacc2659743142b68391d9a").unwrap();
+        // Synthetic key (never installed on a ring); verified against the Python
+        // reference (AES/ECB/PKCS5) used in tools/.
+        let key = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
         let key: [u8; 16] = key.try_into().unwrap();
         let nonce = hex::decode("0e2d6a0a08c99b4365f458e6e97382").unwrap();
         assert_eq!(nonce.len(), 15);
         let out = encrypt_nonce(&key, &nonce);
-        assert_eq!(hex::encode(out), "a38a8772d3acb6db5c2b516dd56987c8");
+        assert_eq!(hex::encode(out), "31e81e047a8239461303cceb32a602a7");
     }
 }

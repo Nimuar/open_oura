@@ -44,10 +44,14 @@ pub extern "C" fn oura_pop_diagnostic() -> *mut c_char {
 }
 
 /// Encrypt a ring auth nonce (AES-128/ECB/PKCS7) into `out` (must hold 16 bytes).
-/// `key` must be exactly 16 bytes; `nonce` is typically 15. Returns 0 on success,
-/// negative on bad arguments.
+/// `key` must be exactly 16 bytes; `nonce` is 1..=16 bytes (typically 15). Returns
+/// 0 on success, negative on bad arguments.
+///
+/// # Safety
+/// `key`/`nonce` must be readable for `key_len`/`nonce_len` bytes and `out`
+/// writable for 16 bytes.
 #[no_mangle]
-pub extern "C" fn oura_encrypt_nonce(
+pub unsafe extern "C" fn oura_encrypt_nonce(
     key: *const u8,
     key_len: usize,
     nonce: *const u8,
@@ -55,7 +59,12 @@ pub extern "C" fn oura_encrypt_nonce(
     out: *mut u8,
 ) -> i32 {
     log_diagnostic("FFI: oura_encrypt_nonce invoked");
-    if key.is_null() || nonce.is_null() || out.is_null() || key_len != 16 {
+    // Lengths are validated before any pointer is turned into a slice: only a
+    // single AES block is ever encrypted, so an out-of-range length is a caller
+    // bug, not something to read past.
+    if key.is_null() || nonce.is_null() || out.is_null() || key_len != 16
+        || nonce_len == 0 || nonce_len > 16
+    {
         log_diagnostic("FFI error: oura_encrypt_nonce invalid arguments");
         return -1;
     }
@@ -73,8 +82,11 @@ pub extern "C" fn oura_encrypt_nonce(
 /// Decode an event body for `tag` into a JSON C string, or null if the tag has no
 /// decoder / the body is malformed. The returned string is owned by the caller and
 /// must be released with [`oura_string_free`].
+///
+/// # Safety
+/// `body` must be readable for `body_len` bytes (or null with `body_len` 0).
 #[no_mangle]
-pub extern "C" fn oura_decode_event(tag: u8, body: *const u8, body_len: usize) -> *mut c_char {
+pub unsafe extern "C" fn oura_decode_event(tag: u8, body: *const u8, body_len: usize) -> *mut c_char {
     log_diagnostic(&format!("FFI: oura_decode_event starting for tag 0x{:02x}, len {}", tag, body_len));
     let body: &[u8] = if body.is_null() || body_len == 0 {
         &[]
@@ -107,8 +119,11 @@ pub extern "C" fn oura_event_name(tag: u8) -> *mut c_char {
 }
 
 /// Release a C string previously returned by this library.
+///
+/// # Safety
+/// `ptr` must be null or a pointer previously returned by this library, freed once.
 #[no_mangle]
-pub extern "C" fn oura_string_free(ptr: *mut c_char) {
+pub unsafe extern "C" fn oura_string_free(ptr: *mut c_char) {
     if !ptr.is_null() {
         // SAFETY: `ptr` came from `CString::into_raw` in this library.
         unsafe { drop(CString::from_raw(ptr)) };
@@ -126,20 +141,20 @@ mod tests {
         assert!(!name_ptr.is_null());
         let c_str = unsafe { CStr::from_ptr(name_ptr) };
         assert_eq!(c_str.to_str().unwrap(), "time_sync");
-        oura_string_free(name_ptr);
+        unsafe { oura_string_free(name_ptr) };
     }
 
     #[test]
     fn test_decode_event_time_sync() {
         // time_sync payload is 4-byte LE unix timestamp.
         let body = [0x01, 0x02, 0x03, 0x04];
-        let json_ptr = oura_decode_event(0x42, body.as_ptr(), body.len());
+        let json_ptr = unsafe { oura_decode_event(0x42, body.as_ptr(), body.len()) };
         assert!(!json_ptr.is_null());
         let c_str = unsafe { CStr::from_ptr(json_ptr) };
         let json_str = c_str.to_str().unwrap();
         // serde_json serialization might vary slightly in ordering but for {"unix_time":67305985} it is straightforward.
         assert_eq!(json_str, "{\"unix_time\":67305985}");
-        oura_string_free(json_ptr);
+        unsafe { oura_string_free(json_ptr) };
     }
 
     #[test]
@@ -147,7 +162,9 @@ mod tests {
         let key = [0u8; 16];
         let nonce = [1u8; 15];
         let mut out = [0u8; 16];
-        let res = oura_encrypt_nonce(key.as_ptr(), key.len(), nonce.as_ptr(), nonce.len(), out.as_mut_ptr());
+        let res = unsafe {
+            oura_encrypt_nonce(key.as_ptr(), key.len(), nonce.as_ptr(), nonce.len(), out.as_mut_ptr())
+        };
         assert_eq!(res, 0);
         // Verify we got non-zero bytes (encryption did something)
         assert_ne!(out, [0u8; 16]);
@@ -165,13 +182,13 @@ mod tests {
         assert!(!log_ptr1.is_null());
         let c_str1 = unsafe { CStr::from_ptr(log_ptr1) };
         assert_eq!(c_str1.to_str().unwrap(), "test log 1");
-        oura_string_free(log_ptr1);
+        unsafe { oura_string_free(log_ptr1) };
 
         let log_ptr2 = oura_pop_diagnostic();
         assert!(!log_ptr2.is_null());
         let c_str2 = unsafe { CStr::from_ptr(log_ptr2) };
         assert_eq!(c_str2.to_str().unwrap(), "test log 2");
-        oura_string_free(log_ptr2);
+        unsafe { oura_string_free(log_ptr2) };
 
         let empty_ptr = oura_pop_diagnostic();
         assert!(empty_ptr.is_null());

@@ -38,7 +38,6 @@ import argparse
 import hashlib
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 
@@ -83,6 +82,8 @@ def get_manifest(token: str, type_: str, version: str, slug: str) -> dict:
 
 def download_image(manifest: dict, out_dir: str, token: str | None) -> str:
     url = manifest["url"]
+    if not url.startswith("https://"):
+        raise SystemExit(f"refusing non-HTTPS image url: {url}")
     # The manifest URL is usually a presigned CDN link (no auth). Send the
     # bearer only if it's back on api.ouraring.com.
     use_token = token if url.startswith(API_BASE) else None
@@ -91,7 +92,11 @@ def download_image(manifest: dict, out_dir: str, token: str | None) -> str:
         raise SystemExit(f"download {url} -> HTTP {status}")
 
     os.makedirs(out_dir, exist_ok=True)
-    fname = manifest.get("filename") or f"{manifest.get('type','fw')}_{manifest.get('version','0')}.bin"
+    # The filename comes from the (remote) manifest: strip any directory part so
+    # it cannot escape --out.
+    fname = os.path.basename(
+        manifest.get("filename") or f"{manifest.get('type','fw')}_{manifest.get('version','0')}.bin"
+    ) or "firmware.bin"
     path = os.path.join(out_dir, fname)
 
     # Integrity checks against the manifest.
@@ -107,15 +112,18 @@ def download_image(manifest: dict, out_dir: str, token: str | None) -> str:
         if got.lower() != manifest["sha256"].lower():
             problems.append(f"sha256 {got} != manifest {manifest['sha256']}")
 
-    with open(path, "wb") as f:
-        f.write(data)
-    print(f"  saved {path}  ({len(data)} bytes)")
     print(f"    md5    {hashlib.md5(data).hexdigest()}")
     print(f"    sha256 {hashlib.sha256(data).hexdigest()}")
+    # Fail closed: an image that doesn't match the manifest is never written, so a
+    # tampered or truncated download can't be flashed to a ring by mistake.
     if problems:
-        print("  !! INTEGRITY MISMATCH: " + "; ".join(problems), file=sys.stderr)
-    else:
-        print("  integrity OK")
+        raise SystemExit("  !! INTEGRITY MISMATCH, not saved: " + "; ".join(problems))
+    if not (manifest.get("sha256") or manifest.get("md5")):
+        raise SystemExit(f"  !! manifest for {fname} has no md5/sha256; refusing to save unverifiable image")
+
+    with open(path, "wb") as f:
+        f.write(data)
+    print(f"  integrity OK, saved {path}  ({len(data)} bytes)")
     return path
 
 

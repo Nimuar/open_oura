@@ -45,12 +45,11 @@ Auth is session-scoped. Run it after connecting when a command returns
    - Success response: `2f022e00`
    - Wrong-key response: `2f022e01`
 
-Local test key generated and stored in ignored
-`captures/horizon-ring3-auth-key.hex`:
-
-- `4431967d8bacc2659743142b68391d9a`
-
-Do not commit auth keys.
+The auth key is per-ring secret material: anyone within BLE range who has it can
+authenticate to the ring and read your data. Keep it only in the gitignored key
+file (`captures/horizon-ring3-auth-key.hex`, or `oura pair`'s `*.key`) and never
+commit or paste it — including in docs, issues, or capture logs. The unit tests
+use a synthetic key (`000102…0f`) that is never installed on a ring.
 
 ## Confirmed Commands
 
