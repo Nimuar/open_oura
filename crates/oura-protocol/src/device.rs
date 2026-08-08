@@ -127,4 +127,45 @@ mod tests {
         // status 0x00 then ASCII "XXXXXXXXXXXX" (real serial scrubbed; see local/device-identifiers.md)
         assert_eq!(parse_product_ascii(&p).as_deref(), Some("XXXXXXXXXXXX"));
     }
+
+    #[test]
+    fn firmware_and_battery_reject_foreign_frames() {
+        // right shape, wrong tag
+        assert!(DeviceInfo::parse(&Packet::new(0x0d, vec![0; 18])).is_none());
+        // right tag, truncated payload
+        assert!(DeviceInfo::parse(&Packet::new(0x09, vec![0; 17])).is_none());
+        assert!(Battery::parse(&Packet::new(0x09, vec![0; 3])).is_none());
+        assert!(Battery::parse(&Packet::new(0x0d, vec![0; 2])).is_none());
+    }
+
+    #[test]
+    fn product_ascii_rejects_errors_and_blanks() {
+        // non-zero status byte = the ring refused the slot
+        assert!(parse_product_ascii(&Packet::new(0x19, vec![0x01, b'X'])).is_none());
+        // padding-only text carries no value
+        assert!(parse_product_ascii(&Packet::new(0x19, vec![0x00, b' ', 0x00])).is_none());
+        assert!(parse_product_ascii(&Packet::new(0x19, vec![])).is_none());
+        assert!(parse_product_ascii(&Packet::new(0x18, vec![0x00, b'X'])).is_none());
+    }
+
+    #[test]
+    fn parses_capability_pairs() {
+        // 2f 06 | ext 02 | page count 02 | (01,01) (02,01)
+        let p = Packet::parse(&hex::decode("2f06020201010201").unwrap()).unwrap();
+        let caps: Vec<(u8, u8)> = parse_capabilities(&p).iter().map(|c| (c.feature, c.value)).collect();
+        assert_eq!(caps, vec![(0x01, 0x01), (0x02, 0x01)]);
+        // a trailing odd byte is ignored rather than mis-paired
+        let p = Packet::parse(&hex::decode("2f050202010102").unwrap()).unwrap();
+        assert_eq!(parse_capabilities(&p).len(), 1);
+    }
+
+    #[test]
+    fn capabilities_reject_other_frames() {
+        // extended frame, but a different op
+        assert!(parse_capabilities(&Packet::new(0x2f, vec![0x21, 0x02, 0x01, 0x01])).is_empty());
+        // not an extended frame at all
+        assert!(parse_capabilities(&Packet::new(0x09, vec![0x02, 0x02, 0x01, 0x01])).is_empty());
+        // extended 0x02 but with no page count
+        assert!(parse_capabilities(&Packet::new(0x2f, vec![0x02])).is_empty());
+    }
 }

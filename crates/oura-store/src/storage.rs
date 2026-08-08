@@ -267,4 +267,189 @@ mod tests {
         let counts = store.event_counts("S1").unwrap();
         assert_eq!(counts, vec![("debug_event".to_string(), 1)]);
     }
+
+    fn event(tag: u8, timestamp: u32, body: Vec<u8>) -> RingEvent {
+        RingEvent {
+            tag,
+            name: oura_protocol::events::event_name(tag),
+            timestamp,
+            body,
+            decoded: None,
+        }
+    }
+
+    #[test]
+    fn cursor_defaults_to_zero_and_overwrites() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.cursor("unknown").unwrap(), 0);
+        store.set_cursor("S1", 10).unwrap();
+        store.set_cursor("S1", 20).unwrap();
+        assert_eq!(store.cursor("S1").unwrap(), 20);
+        assert_eq!(store.cursor("S2").unwrap(), 0);
+    }
+
+    #[test]
+    fn upsert_device_keeps_known_fields_on_partial_update() {
+        let store = Store::open_in_memory().unwrap();
+        let info = DeviceInfo {
+            api_version: "2.0.0".into(),
+            firmware_version: "3.4.3".into(),
+            bootloader_version: "1.0.1".into(),
+            bt_stack_version: "5.0.0".into(),
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+        };
+        store.upsert_device("S1", Some("BLB_03"), Some(&info)).unwrap();
+        // A later info-less upsert must not wipe the firmware/mac already stored.
+        store.upsert_device("S1", None, None).unwrap();
+
+        let (hardware_id, firmware, mac): (Option<String>, Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT hardware_id, firmware, mac FROM device WHERE serial = ?1",
+                params!["S1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(hardware_id.as_deref(), Some("BLB_03"));
+        assert_eq!(firmware.as_deref(), Some("3.4.3"));
+        assert_eq!(mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn events_differing_in_body_are_both_stored() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.insert_event("S1", &event(0x43, 1, vec![1])).unwrap());
+        assert!(store.insert_event("S1", &event(0x43, 1, vec![2])).unwrap());
+        assert_eq!(store.event_counts("S1").unwrap(), vec![("debug_event".to_string(), 2)]);
+    }
+
+    #[test]
+    fn insert_event_persists_decoded_json() {
+        let store = Store::open_in_memory().unwrap();
+        let mut ev = event(0x42, 5, vec![0x01, 0x02, 0x03, 0x04]);
+        ev.decoded = Some(serde_json::json!({ "unix_time": 67_305_985u32 }));
+        assert!(store.insert_event("S1", &ev).unwrap());
+
+        let decoded = store.decoded_events().unwrap();
+        assert_eq!(decoded.len(), 1);
+        let (ts, tag, json, _captured) = &decoded[0];
+        assert_eq!((*ts, *tag), (5, 0x42));
+        assert_eq!(json, "{\"unix_time\":67305985}");
+    }
+
+    #[test]
+    fn decoded_events_skips_undecoded_and_orders_by_ring_time() {
+        let store = Store::open_in_memory().unwrap();
+        let mut later = event(0x42, 20, vec![0x02, 0, 0, 0]);
+        later.decoded = Some(serde_json::json!({ "unix_time": 2 }));
+        let mut earlier = event(0x42, 10, vec![0x01, 0, 0, 0]);
+        earlier.decoded = Some(serde_json::json!({ "unix_time": 1 }));
+        store.insert_event("S1", &later).unwrap();
+        store.insert_event("S1", &earlier).unwrap();
+        // No decoder for this tag, so it must not appear in decoded_events().
+        store.insert_event("S1", &event(0x44, 15, vec![9])).unwrap();
+
+        let timestamps: Vec<i64> = store.decoded_events().unwrap().iter().map(|r| r.0).collect();
+        assert_eq!(timestamps, vec![10, 20]);
+    }
+
+    #[test]
+    fn redecode_applies_current_decoders_and_fixes_names() {
+        let store = Store::open_in_memory().unwrap();
+        // Stored without a decode, and with a stale name, as an older client would.
+        let mut stale = event(0x42, 7, vec![0x4f, 0xd2, 0x37, 0x6a]);
+        stale.name = "unknown";
+        store.insert_event("S1", &stale).unwrap();
+        // A tag with no decoder: counted in the total but not as decoded.
+        store.insert_event("S1", &event(0x44, 8, vec![1, 2])).unwrap();
+
+        assert_eq!(store.redecode().unwrap(), (1, 2));
+        let decoded = store.decoded_events().unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].2, "{\"unix_time\":1782043215}");
+        let mut names: Vec<String> = store.event_counts("S1").unwrap().into_iter().map(|c| c.0).collect();
+        names.sort();
+        assert_eq!(names, vec!["ibi_event", "time_sync"]);
+    }
+
+    #[test]
+    fn device_serials_are_distinct_and_sorted() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event("S2", &event(0x43, 1, vec![1])).unwrap();
+        store.insert_event("S1", &event(0x43, 1, vec![1])).unwrap();
+        store.insert_event("S2", &event(0x43, 2, vec![1])).unwrap();
+        assert_eq!(store.device_serials().unwrap(), vec!["S1", "S2"]);
+    }
+
+    #[test]
+    fn readings_and_battery_are_appended() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_reading("S1", "hr_bpm", 61.0, "bpm").unwrap();
+        store.insert_reading("S1", "hr_bpm", 62.0, "bpm").unwrap();
+        store
+            .insert_battery(
+                "S1",
+                &Battery {
+                    percent: 89,
+                    charging_progress: 0,
+                    charging_recommended: 0,
+                },
+            )
+            .unwrap();
+
+        let rows: Vec<(String, f64, String)> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT kind, value, unit FROM readings ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("hr_bpm".to_string(), 61.0, "bpm".to_string()),
+                ("hr_bpm".to_string(), 62.0, "bpm".to_string()),
+                ("battery_percent".to_string(), 89.0, "%".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn open_persists_across_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "oura-store-test-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_event("S1", &event(0x43, 1, vec![1])).unwrap();
+            store.set_cursor("S1", 99).unwrap();
+        }
+        {
+            // Re-opening must find the existing schema and rows intact.
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.cursor("S1").unwrap(), 99);
+            assert_eq!(store.device_serials().unwrap(), vec!["S1"]);
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_reports_storage_error_for_unusable_path() {
+        let err = match Store::open("/nonexistent-directory/oura.sqlite") {
+            Err(e) => e,
+            Ok(_) => panic!("expected open to fail"),
+        };
+        assert!(
+            matches!(&err, crate::error::Error::Storage(msg) if msg.contains("unable to open")),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().starts_with("storage error: "));
+    }
 }

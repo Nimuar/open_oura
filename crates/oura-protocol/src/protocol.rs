@@ -347,6 +347,64 @@ mod tests {
     }
 
     #[test]
+    fn simple_requests_match_known_hex() {
+        assert_eq!(hex::encode(req_battery()), "0c00");
+        assert_eq!(hex::encode(req_auth_nonce()), "2f012b");
+        assert_eq!(hex::encode(req_set_notification(0x03)), "1c0103");
+        assert_eq!(hex::encode(req_capabilities(1)), "2f020101");
+        assert_eq!(hex::encode(req_check_sleep_analysis(true)), "280101");
+        assert_eq!(hex::encode(req_check_sleep_analysis(false)), "280100");
+    }
+
+    #[test]
+    fn auth_requests_carry_the_key_material() {
+        let key = [0xabu8; 16];
+        // 24 10 <16-byte key>
+        assert_eq!(hex::encode(req_set_auth_key(&key)), format!("2410{}", "ab".repeat(16)));
+        // 2f 11 2d <16-byte ciphertext>
+        assert_eq!(
+            hex::encode(req_authenticate(&key)),
+            format!("2f112d{}", "ab".repeat(16))
+        );
+    }
+
+    #[test]
+    fn sync_time_is_little_endian_with_timezone() {
+        // 12 09 <unix u64 LE> <tz half-hours>
+        assert_eq!(hex::encode(req_sync_time(1, 4)), "1209010000000000000004");
+    }
+
+    #[test]
+    fn feature_requests_match_known_hex() {
+        assert_eq!(hex::encode(req_feature_status(feature::SPO2)), "2f022004");
+        assert_eq!(hex::encode(req_feature_latest(feature::SPO2)), "2f022404");
+        assert_eq!(
+            hex::encode(req_set_feature_mode(feature::DAYTIME_HR, feature_mode::CONNECTED_LIVE)),
+            "2f03220203"
+        );
+        assert_eq!(
+            hex::encode(req_set_feature_subscription(
+                capability::REAL_STEPS,
+                subscription_mode::FEATURE_DATA
+            )),
+            "2f03260b04"
+        );
+    }
+
+    #[test]
+    fn ext_tag_only_applies_to_extended_frames() {
+        assert_eq!(Packet::new(0x2f, vec![0x2b, 0x01]).ext_tag(), Some(0x2b));
+        assert_eq!(Packet::new(0x2f, vec![]).ext_tag(), None);
+        assert_eq!(Packet::new(0x09, vec![0x2b]).ext_tag(), None);
+    }
+
+    #[test]
+    fn parse_rejects_headerless_frames() {
+        assert_eq!(Packet::parse(&[]), None);
+        assert_eq!(Packet::parse(&[0x25]), None);
+    }
+
+    #[test]
     fn parse_handles_padding() {
         // declared length 1 but extra trailing byte
         let p = Packet::parse(&[0x25, 0x01, 0x00]).unwrap();

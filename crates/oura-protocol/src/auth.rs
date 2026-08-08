@@ -74,4 +74,26 @@ mod tests {
         let out = encrypt_nonce(&key, &nonce);
         assert_eq!(hex::encode(out), "a38a8772d3acb6db5c2b516dd56987c8");
     }
+
+    #[test]
+    fn auth_result_maps_ring_status_bytes() {
+        assert_eq!(AuthResult::from(0x00), AuthResult::Success);
+        assert_eq!(AuthResult::from(0x01), AuthResult::AuthenticationError);
+        assert_eq!(AuthResult::from(0x02), AuthResult::InFactoryReset);
+        assert_eq!(AuthResult::from(0x03), AuthResult::NotOriginalOnboardedDevice);
+        assert_eq!(AuthResult::from(0x7f), AuthResult::Unknown(0x7f));
+        assert!(AuthResult::Success.is_success());
+        assert!(!AuthResult::InFactoryReset.is_success());
+    }
+
+    #[test]
+    fn nonce_longer_than_a_block_is_truncated_without_padding() {
+        // A 16-byte nonce fills the block, so no PKCS7 byte is appended.
+        let key = [0u8; 16];
+        let full = encrypt_nonce(&key, &[1u8; 16]);
+        let over = encrypt_nonce(&key, &[1u8; 20]);
+        assert_eq!(full, over);
+        // A shorter nonce pads with the pad length, so it must differ.
+        assert_ne!(full, encrypt_nonce(&key, &[1u8; 14]));
+    }
 }

@@ -636,4 +636,357 @@ mod tests {
         assert_eq!(s.ibi_ms, 857);
         assert_eq!(s.bpm, 70);
     }
+
+    const QUIET: Duration = Duration::from_millis(20);
+
+    /// A client over a transport scripted with `(request, responses)` pairs, keyed
+    /// by the request builders so the tests never hand-encode a request.
+    fn client(script: &[(Vec<u8>, &[&str])]) -> OuraClient<MockTransport> {
+        let mock = MockTransport::new();
+        for (request, responses) in script {
+            mock.on(&hex::encode(request), responses);
+        }
+        OuraClient::new(mock).with_quiet(QUIET)
+    }
+
+    #[test]
+    fn acm_sample_helpers() {
+        let frame = [0x33, 0x0c, 0x32, 0x01, 3, 0, 4, 0, 0, 0];
+        let samples = AcmSample::parse_frame(&frame);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].magnitude(), 5.0);
+    }
+
+    #[test]
+    fn acm_frame_rejects_foreign_or_short_frames() {
+        assert!(parse_acm_frame(&[0x33, 0x02, 0x32, 0x01]).is_empty());
+        assert!(parse_acm_frame(&[0x2f, 0x0c, 0x32, 0x01, 1, 0, 2, 0, 3, 0]).is_empty());
+    }
+
+    #[test]
+    fn live_hr_frame_rejects_bad_frames() {
+        // validity nibble 0 (not VALID) -> no sample
+        assert!(parse_live_hr_frame(&[0x2f, 0x08, 0x28, 0x02, 0, 2, 0, 0, 0x59, 0x03]).is_none());
+        // a different feature's indication
+        assert!(parse_live_hr_frame(&[0x2f, 0x08, 0x28, 0x04, 0, 2, 0, 0, 0x59, 0x13]).is_none());
+        // wrong sub-tag / too short
+        assert!(parse_live_hr_frame(&[0x2f, 0x08, 0x25, 0x02, 0, 2, 0, 0, 0x59, 0x13]).is_none());
+        assert!(parse_live_hr_frame(&[0x2f, 0x08, 0x28]).is_none());
+        // implausible IBI (60 ms) is dropped rather than reported as 1000 bpm
+        assert!(parse_live_hr_frame(&[0x2f, 0x08, 0x28, 0x02, 0, 2, 0, 0, 0x3c, 0x10]).is_none());
+    }
+
+    #[tokio::test]
+    async fn reads_battery_serial_and_hardware_id() {
+        let c = client(&[
+            (protocol::req_battery(), &["0d0659000001f00f"]),
+            (
+                protocol::product::SERIAL.to_vec(),
+                &["191100585858585858585858585858"],
+            ),
+            (protocol::product::HARDWARE.to_vec(), &["190700424c425f3033"]),
+        ]);
+        assert_eq!(c.battery().await.unwrap().percent, 0x59);
+        assert_eq!(c.serial().await.unwrap(), "XXXXXXXXXXXX");
+        assert_eq!(c.hardware_id().await.unwrap(), "BLB_03");
+    }
+
+    #[tokio::test]
+    async fn missing_responses_surface_as_protocol_errors() {
+        let c = client(&[]);
+        for err in [
+            c.firmware().await.unwrap_err().to_string(),
+            c.battery().await.unwrap_err().to_string(),
+            c.serial().await.unwrap_err().to_string(),
+            c.hardware_id().await.unwrap_err().to_string(),
+            c.check_sleep_analysis(false).await.unwrap_err().to_string(),
+            c.feature_status(feature::SPO2).await.unwrap_err().to_string(),
+            c.feature_latest(feature::SPO2).await.unwrap_err().to_string(),
+            c.set_feature_mode(feature::SPO2, 1).await.unwrap_err().to_string(),
+            c.set_feature_subscription(protocol::capability::ATLAS, 1)
+                .await
+                .unwrap_err()
+                .to_string(),
+            c.rdata_state().await.unwrap_err().to_string(),
+            c.rdata_get_page(0).await.unwrap_err().to_string(),
+            c.rdata_configure(&[], 0, 0).await.unwrap_err().to_string(),
+            c.set_auth_key(&[0u8; 16]).await.unwrap_err().to_string(),
+        ] {
+            assert!(err.starts_with("protocol error"), "unexpected error: {err}");
+        }
+        // Fire-and-forget commands don't wait for a response.
+        c.sync_time().await.unwrap();
+        c.set_notification(0x03).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_both_capability_pages() {
+        let c = client(&[
+            (protocol::req_capabilities(0), &["2f06020201010201"]),
+            (protocol::req_capabilities(1), &["2f0402010803"]),
+        ]);
+        let caps = c.capabilities().await.unwrap();
+        let pairs: Vec<(u8, u8)> = caps.iter().map(|c| (c.feature, c.value)).collect();
+        assert_eq!(pairs, vec![(0x01, 0x01), (0x02, 0x01), (0x08, 0x03)]);
+    }
+
+    #[tokio::test]
+    async fn authenticate_reports_ring_rejection() {
+        let key = [0u8; 16];
+        let encrypted = encrypt_nonce(&key, &[0u8; 15]);
+        let nonce_response = format!("2f102c{}", hex::encode([0u8; 15]));
+        let c = client(&[
+            (protocol::req_auth_nonce(), &[nonce_response.as_str()]),
+            // state 0x01 = AuthenticationError
+            (protocol::req_authenticate(&encrypted), &["2f022e01"]),
+        ]);
+        let err = c.authenticate(&key).await.unwrap_err().to_string();
+        assert!(err.contains("AuthenticationError"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn authenticate_requires_nonce_and_status() {
+        let key = [0u8; 16];
+        let encrypted = encrypt_nonce(&key, &[0u8; 15]);
+        let nonce_response = format!("2f102c{}", hex::encode([0u8; 15]));
+        assert!(client(&[])
+            .authenticate(&key)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no nonce response"));
+        // Nonce arrives but the ring never answers the Authenticate itself.
+        let c = client(&[
+            (protocol::req_auth_nonce(), &[nonce_response.as_str()]),
+            (protocol::req_authenticate(&encrypted), &[]),
+        ]);
+        assert!(c
+            .authenticate(&key)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no authenticate response"));
+    }
+
+    #[tokio::test]
+    async fn set_auth_key_maps_status_byte() {
+        let key = [0u8; 16];
+        let ok = client(&[(protocol::req_set_auth_key(&key), &["250100"])]);
+        ok.set_auth_key(&key).await.unwrap();
+
+        let rejected = client(&[(protocol::req_set_auth_key(&key), &["250102"])]);
+        let err = rejected.set_auth_key(&key).await.unwrap_err().to_string();
+        assert!(err.contains("set_auth_key status 0x02"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn drains_events_across_batches_and_persists_cursor_per_batch() {
+        let c = client(&[
+            // batch 1: one event at ts=10, 100 bytes still queued
+            (
+                protocol::req_get_event(0, 255, -1),
+                &["43060a0000006869", "1106010064000000"],
+            ),
+            // batch 2: one event at ts=20, drained
+            (
+                protocol::req_get_event(11, 255, -1),
+                &["4306140000006869", "1106010000000000"],
+            ),
+        ]);
+        let mut seen = Vec::new();
+        let mut cursors = Vec::new();
+        let outcome = c
+            .drain_events(0, |ev| seen.push((ev.tag, ev.timestamp)), |c| cursors.push(c))
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![(0x43, 10), (0x43, 20)]);
+        assert_eq!(cursors, vec![11, 21]);
+        assert_eq!(outcome.events_synced, 2);
+        assert_eq!(outcome.next_cursor, 21);
+    }
+
+    #[tokio::test]
+    async fn drain_events_stops_when_no_progress_is_possible() {
+        // The ring claims bytes are left but returns no events: must not spin.
+        let c = client(&[(protocol::req_get_event(7, 255, -1), &["1106000064000000"])]);
+        let mut batches = 0;
+        let outcome = c.drain_events(7, |_| {}, |_| batches += 1).await.unwrap();
+        assert_eq!(outcome.events_synced, 0);
+        assert_eq!(outcome.next_cursor, 7);
+        assert_eq!(batches, 0);
+    }
+
+    #[tokio::test]
+    async fn feature_latest_decodes_each_feature() {
+        let c = client(&[
+            // daytime HR: data[0..2] = IBI 857 ms -> 70 bpm
+            (
+                protocol::req_feature_latest(feature::DAYTIME_HR),
+                &["2f09250200000000005903"],
+            ),
+            // exercise HR: data[4] = 72 bpm
+            (
+                protocol::req_feature_latest(feature::EXERCISE_HR),
+                &["2f0c250300000000000000000048"],
+            ),
+            // SpO2: data[3] = 97 %, data[4] = 60 bpm
+            (
+                protocol::req_feature_latest(feature::SPO2),
+                &["2f0c25040000000000000000613c"],
+            ),
+            // a feature with no known layout still parses to empty values
+            (
+                protocol::req_feature_latest(feature::RESTING_HR),
+                &["2f0925080000000000ffff"],
+            ),
+        ]);
+        assert_eq!(c.feature_latest(feature::DAYTIME_HR).await.unwrap().bpm, Some(70));
+        assert_eq!(c.feature_latest(feature::EXERCISE_HR).await.unwrap().bpm, Some(72));
+        let spo2 = c.feature_latest(feature::SPO2).await.unwrap();
+        assert_eq!((spo2.spo2_percent, spo2.bpm), (Some(97), Some(60)));
+        let unknown = c.feature_latest(feature::RESTING_HR).await.unwrap();
+        assert_eq!((unknown.bpm, unknown.spo2_percent), (None, None));
+    }
+
+    #[tokio::test]
+    async fn feature_latest_ignores_zero_and_implausible_values() {
+        let c = client(&[
+            // IBI 60 ms is implausible -> no bpm
+            (
+                protocol::req_feature_latest(feature::DAYTIME_HR),
+                &["2f09250200000000003c00"],
+            ),
+            // zero bytes mean "no measurement yet"
+            (
+                protocol::req_feature_latest(feature::SPO2),
+                &["2f0c250400000000000000000000"],
+            ),
+        ]);
+        assert_eq!(c.feature_latest(feature::DAYTIME_HR).await.unwrap().bpm, None);
+        let spo2 = c.feature_latest(feature::SPO2).await.unwrap();
+        assert_eq!((spo2.spo2_percent, spo2.bpm), (None, None));
+    }
+
+    #[tokio::test]
+    async fn feature_status_parses_and_rejects_short_payloads() {
+        let c = client(&[
+            (
+                protocol::req_feature_status(feature::DAYTIME_HR),
+                &["2f06210201000201"],
+            ),
+            // ext 0x21 but truncated -> unusable
+            (protocol::req_feature_status(feature::SPO2), &["2f03210401"]),
+        ]);
+        let s = c.feature_status(feature::DAYTIME_HR).await.unwrap();
+        assert_eq!((s.feature, s.mode, s.status, s.state, s.subscription), (2, 1, 0, 2, 1));
+        assert!(c.feature_status(feature::SPO2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_feature_mode_maps_result_byte() {
+        let c = client(&[
+            (
+                protocol::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::AUTOMATIC),
+                &["2f03230200"],
+            ),
+            (
+                protocol::req_set_feature_mode(feature::SPO2, feature_mode::OFF),
+                &["2f03230405"],
+            ),
+        ]);
+        c.set_feature_mode(feature::DAYTIME_HR, feature_mode::AUTOMATIC)
+            .await
+            .unwrap();
+        let err = c
+            .set_feature_mode(feature::SPO2, feature_mode::OFF)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("set_feature_mode result 0x05"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_feature_subscription_returns_raw_result() {
+        let c = client(&[(
+            protocol::req_set_feature_subscription(
+                protocol::capability::REAL_STEPS,
+                protocol::subscription_mode::FEATURE_DATA,
+            ),
+            // ext 0x27, capability 0x0b, result 0x03 (rejected by firmware)
+            &["2f03270b03"],
+        )]);
+        assert_eq!(
+            c.set_feature_subscription(
+                protocol::capability::REAL_STEPS,
+                protocol::subscription_mode::FEATURE_DATA
+            )
+            .await
+            .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn check_sleep_analysis_returns_status() {
+        let c = client(&[(protocol::req_check_sleep_analysis(true), &["290102"])]);
+        assert_eq!(c.check_sleep_analysis(true).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn rdata_lifecycle_responses() {
+        let c = client(&[
+            (protocol::req_rdata_state(), &["03020500"]),
+            (protocol::req_rdata_stop(), &["03020301"]),
+            (
+                protocol::req_rdata_configure(&[protocol::rdata::DataType::Ppg250Hz], 0, 0),
+                &["03020200"],
+            ),
+            (protocol::req_rdata_get_page(3), &["03040100aabb"]),
+            // page past the end: status 6 = NO_DATA, no bytes
+            (protocol::req_rdata_get_page(4), &["03020106"]),
+        ]);
+        assert_eq!(c.rdata_state().await.unwrap(), (5, 0));
+        assert_eq!(c.rdata_stop().await.unwrap(), 1);
+        assert_eq!(
+            c.rdata_configure(&[protocol::rdata::DataType::Ppg250Hz], 0, 0)
+                .await
+                .unwrap(),
+            (2, 0)
+        );
+        assert_eq!(c.rdata_get_page(3).await.unwrap(), (0, vec![0xaa, 0xbb]));
+        assert_eq!(c.rdata_get_page(4).await.unwrap(), (6, Vec::new()));
+        // stop/clear tolerate a silent ring (255 = no status seen)
+        let silent = client(&[]);
+        assert_eq!(silent.rdata_stop().await.unwrap(), 255);
+        assert_eq!(silent.rdata_clear().await.unwrap(), 255);
+    }
+
+    #[tokio::test]
+    async fn live_heart_rate_yields_samples_from_notifications() {
+        let c = client(&[(
+            protocol::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::CONNECTED_LIVE),
+            // one valid beat (857 ms) and one invalid-validity frame
+            &["2f082802000200005913", "2f082802000200005903"],
+        )]);
+        let mut samples = Vec::new();
+        c.live_heart_rate(Duration::from_millis(50), true, |s| samples.push(s))
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!((samples[0].bpm, samples[0].ibi_ms), (70, 857));
+    }
+
+    #[tokio::test]
+    async fn stream_accelerometer_yields_samples_from_notifications() {
+        let c = client(&[(
+            protocol::req_set_realtime(protocol::realtime::ACM, 1, 0),
+            &["330c3201010002000300040005000600"],
+        )]);
+        let mut samples = Vec::new();
+        c.stream_accelerometer(Duration::from_millis(50), |s| samples.push(s))
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!((samples[1].x, samples[1].y, samples[1].z), (4, 5, 6));
+    }
 }
